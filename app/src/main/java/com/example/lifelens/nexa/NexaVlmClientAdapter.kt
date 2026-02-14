@@ -7,8 +7,6 @@ class NexaVlmClientAdapter(
 ) : VisionClient {
 
     override suspend fun explain(imagePath: String, prompt: String): String {
-        // demo-only: official quickstart uses text generation first
-        // imagePath is ignored here; we just run a text prompt.
-        return client.generate(prompt)
+        return client.generateWithImage(prompt, imagePath)
     }
 }

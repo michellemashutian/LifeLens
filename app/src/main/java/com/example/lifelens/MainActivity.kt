@@ -20,6 +20,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,6 +37,7 @@ import androidx.core.content.ContextCompat
 import com.example.lifelens.camera.takePhoto
 import com.example.lifelens.nexa.ModelManager
 import com.example.lifelens.nexa.NexaVlmClient
+import com.example.lifelens.speech.SpeechRecognizerHelper
 import com.example.lifelens.tool.*
 import com.example.lifelens.ui.theme.LifeLensTheme
 import kotlinx.coroutines.Dispatchers
@@ -104,9 +109,26 @@ class MainActivity : ComponentActivity() {
                 var nexaReady by remember { mutableStateOf(false) }
                 var activeClient by remember { mutableStateOf<NexaVlmClient?>(null) }
 
+                // speech recognizer
+                val speechHelper = remember { SpeechRecognizerHelper(context) }
+
                 DisposableEffect(Unit) {
-                    onDispose { scope.launch { runCatching { activeClient?.destroy() } } }
+                    onDispose {
+                        scope.launch { runCatching { activeClient?.destroy() } }
+                        speechHelper.destroy()
+                    }
                 }
+
+                // audio permission
+                var audioGranted by remember {
+                    mutableStateOf(
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                                PackageManager.PERMISSION_GRANTED
+                    )
+                }
+                val audioPermissionLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.RequestPermission()
+                ) { granted -> audioGranted = granted }
 
                 // tools (kept, but demo test won't use them)
                 val knowledgeServer = remember { KnowledgeServer(context) }
@@ -119,16 +141,34 @@ class MainActivity : ComponentActivity() {
                 var detect by remember { mutableStateOf<VisionDetectResult?>(null) }
                 var bundle by remember { mutableStateOf<ToolBundle?>(null) }
 
-                // Upload photo (kept, but we won't call describeImage in demo mode)
+                // "Ask with Camera" state
+                var questionText by remember { mutableStateOf("") }
+                var isListening by remember { mutableStateOf(false) }
+                var isProcessing by remember { mutableStateOf(false) }
+                var streamingAnswer by remember { mutableStateOf("") }
+
+                // Uploaded image path for VLM queries
+                var uploadedImagePath by remember { mutableStateOf<String?>(null) }
+
+                // Upload photo → copy to cache, store path for VLM queries
                 val uploadLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.GetContent()
                 ) { uri: Uri? ->
                     if (uri == null) return@rememberLauncherForActivityResult
                     scope.launch {
                         runCatching {
-                            headline = "Not supported"
-                            detail = "Demo mode: use Test button (text generation)."
+                            headline = "Loading image..."
+                            detail = "Copying uploaded photo."
                             progress = null
+
+                            val outFile = File(context.cacheDir, "upload_${System.currentTimeMillis()}.jpg")
+                            copyUriToFile(context.contentResolver, uri, outFile)
+                            uploadedImagePath = outFile.absolutePath
+
+                            Log.d("LifeLens", "Uploaded image: ${outFile.absolutePath} (${outFile.length()} bytes)")
+
+                            headline = "Image ready"
+                            detail = "Type or speak a question, then tap Send."
                         }.onFailure {
                             headline = "Failed"
                             detail = it.message ?: "Unknown error"
@@ -161,7 +201,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // ✅ demo init: do not pass mmproj, do not do describeImage
                 suspend fun createAndInitClient(pid: String): Result<NexaVlmClient> = withContext(Dispatchers.IO) {
                     runCatching {
                         val entryPath = modelManager.entryPath(spec)
@@ -170,17 +209,119 @@ class MainActivity : ComponentActivity() {
                         Log.d("LifeLens", "createAndInitClient(pid=$pid)")
                         Log.d("LifeLens", "entryPath=$entryPath exists=${entry.exists()} isFile=${entry.isFile} len=${entry.length()}")
 
+                        // Check all model files
+                        val missing = modelManager.missingFiles(spec)
+                        if (missing.isNotEmpty()) {
+                            error("Model files missing: ${missing.joinToString()}")
+                        }
+
                         require(entry.exists() && entry.isFile && entry.length() > 0L) {
                             "Model entry file missing: ${entry.absolutePath}"
                         }
 
+                        val mmprojPath = modelManager.mmprojPath(spec)
+                        Log.d("LifeLens", "mmprojPath=$mmprojPath")
+
                         val c = NexaVlmClient(
                             context = context,
-                            modelPath = entryPath
+                            modelPath = entryPath,
+                            mmprojPath = mmprojPath,
+                            pluginId = pid
                         )
                         c.init()
                         c
                     }
+                }
+
+                fun handleAskWithImage(question: String) {
+                    if (question.isBlank()) return
+                    if (isProcessing) return
+
+                    scope.launch {
+                        isProcessing = true
+                        streamingAnswer = ""
+
+                        try {
+                            val client = activeClient
+                                ?: error("Model not initialized. Tap Get Started first.")
+
+                            // Use uploaded image if available, otherwise capture from camera
+                            val imagePath: String
+                            if (uploadedImagePath != null) {
+                                imagePath = uploadedImagePath!!
+                                headline = "Thinking..."
+                                detail = question
+                                Log.d("LifeLens", "Using uploaded image: $imagePath")
+                            } else {
+                                headline = "Capturing..."
+                                detail = question
+                                val photoFile = File(
+                                    context.cacheDir,
+                                    "ask_capture_${System.currentTimeMillis()}.jpg"
+                                )
+                                val captured = takePhoto(context, imageCapture, photoFile)
+                                imagePath = captured.absolutePath
+                                Log.d("LifeLens", "Captured frame: $imagePath (${captured.length()} bytes)")
+                                headline = "Thinking..."
+                                detail = question
+                            }
+
+                            client.generateWithImageStream(question, imagePath).collect { token ->
+                                streamingAnswer += token
+                            }
+
+                            headline = "Answer"
+                            detail = question
+
+                        } catch (t: Throwable) {
+                            Log.e("LifeLens", "Ask failed", t)
+                            headline = "Failed"
+                            detail = t.message ?: "Unknown error"
+                            if (streamingAnswer.isBlank()) {
+                                streamingAnswer = "Error: ${t.message}"
+                            }
+                        } finally {
+                            isProcessing = false
+                        }
+                    }
+                }
+
+                fun handleMicPress() {
+                    if (isListening) {
+                        speechHelper.stopListening()
+                        isListening = false
+                        return
+                    }
+
+                    if (!audioGranted) {
+                        audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        return
+                    }
+
+                    if (!speechHelper.isAvailable()) {
+                        headline = "Speech not available"
+                        detail = "This device does not support speech recognition."
+                        return
+                    }
+
+                    isListening = true
+                    speechHelper.startListening(
+                        onPartialResult = { partial ->
+                            questionText = partial
+                        },
+                        onFinalResult = { finalText ->
+                            isListening = false
+                            if (finalText.isNotBlank()) {
+                                questionText = finalText
+                                handleAskWithImage(finalText)
+                            }
+                        },
+                        onError = { errorCode ->
+                            isListening = false
+                            headline = "Mic error"
+                            detail = "Speech recognizer error code: $errorCode"
+                        }
+                    )
                 }
 
                 fun startSetup() {
@@ -222,16 +363,22 @@ class MainActivity : ComponentActivity() {
                                 if (!modelReady) error("Download incomplete. Missing: ${missingAfter.joinToString()}")
                             }
 
-                            // 3) init (NO CPU fallback)
+                            // 3) init
                             headline = "Initializing..."
-                            detail = if (pluginId == "cpu") "Starting on CPU…" else "Starting on NPU…"
+                            detail = "Starting on ${pluginId.uppercase()}…"
                             progress = null
 
                             val r1 = createAndInitClient(pluginId)
                             if (r1.isSuccess) {
                                 runCatching { activeClient?.destroy() }
-                                activeClient = r1.getOrNull()
+                                val client = r1.getOrNull()!!
+                                activeClient = client
                                 nexaReady = true
+                                val usedPlugin = client.activePluginId
+                                Log.d("LifeLens", "Model initialized on $usedPlugin")
+                                if (usedPlugin != pluginId) {
+                                    detail = "Running on $usedPlugin (${pluginId} unavailable)"
+                                }
                             } else {
                                 val e1 = r1.exceptionOrNull()
                                 Log.e("LifeLens", "Init failed for plugin=$pluginId", e1)
@@ -311,6 +458,7 @@ class MainActivity : ComponentActivity() {
                                 previewView = previewView,
                                 cameraGranted = cameraGranted,
                                 cameraReady = cameraReady,
+                                hasUploadedImage = uploadedImagePath != null,
                                 onRequestCamera = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
                                 onBindCamera = { bindCamera() },
                                 audience = audience,
@@ -346,7 +494,14 @@ class MainActivity : ComponentActivity() {
                                 rawOutput = rawOutput,
                                 detect = detect,
                                 bundle = bundle,
-                                actionServer = actionServer
+                                actionServer = actionServer,
+                                questionText = questionText,
+                                onQuestionTextChange = { questionText = it },
+                                isListening = isListening,
+                                isProcessing = isProcessing,
+                                streamingAnswer = streamingAnswer,
+                                onMicPress = { handleMicPress() },
+                                onAskSubmit = { handleAskWithImage(questionText) }
                             )
                         }
                     }
@@ -494,6 +649,7 @@ private fun ReadyScreen(
     previewView: PreviewView,
     cameraGranted: Boolean,
     cameraReady: Boolean,
+    hasUploadedImage: Boolean,
     onRequestCamera: () -> Unit,
     onBindCamera: () -> Unit,
     audience: Audience,
@@ -506,7 +662,14 @@ private fun ReadyScreen(
     rawOutput: String,
     detect: VisionDetectResult?,
     bundle: ToolBundle?,
-    actionServer: ActionServer
+    actionServer: ActionServer,
+    questionText: String,
+    onQuestionTextChange: (String) -> Unit,
+    isListening: Boolean,
+    isProcessing: Boolean,
+    streamingAnswer: String,
+    onMicPress: () -> Unit,
+    onAskSubmit: () -> Unit
 ) {
     val scroll = rememberScrollState()
 
@@ -586,6 +749,105 @@ private fun ReadyScreen(
                     .height(52.dp),
                 shape = RoundedCornerShape(16.dp)
             ) { Text("Upload Photo") }
+        }
+
+        // "Ask about what you see" input bar
+        Spacer(Modifier.height(12.dp))
+
+        Card(shape = RoundedCornerShape(20.dp)) {
+            Column(Modifier.padding(14.dp)) {
+                Text(
+                    "Ask about what you see",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(Modifier.height(8.dp))
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    OutlinedTextField(
+                        value = questionText,
+                        onValueChange = onQuestionTextChange,
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("What is this?") },
+                        singleLine = true,
+                        enabled = !isProcessing,
+                        shape = RoundedCornerShape(14.dp)
+                    )
+
+                    Spacer(Modifier.width(8.dp))
+
+                    IconButton(
+                        onClick = onMicPress,
+                        enabled = !isProcessing
+                    ) {
+                        Icon(
+                            imageVector = if (isListening) Icons.Default.MicOff
+                                          else Icons.Default.Mic,
+                            contentDescription = if (isListening) "Stop listening"
+                                                 else "Start voice input",
+                            tint = if (isListening) MaterialTheme.colorScheme.error
+                                   else MaterialTheme.colorScheme.primary
+                        )
+                    }
+
+                    IconButton(
+                        onClick = onAskSubmit,
+                        enabled = questionText.isNotBlank() && !isProcessing
+                                  && (hasUploadedImage || (cameraGranted && cameraReady))
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            contentDescription = "Ask",
+                            tint = if (questionText.isNotBlank() && !isProcessing)
+                                       MaterialTheme.colorScheme.primary
+                                   else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                        )
+                    }
+                }
+
+                if (isListening) {
+                    Spacer(Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "Listening...",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+
+                if (isProcessing) {
+                    Spacer(Modifier.height(6.dp))
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+            }
+        }
+
+        // Streaming answer display
+        if (streamingAnswer.isNotBlank()) {
+            Spacer(Modifier.height(12.dp))
+            Card(shape = RoundedCornerShape(20.dp)) {
+                Column(Modifier.padding(14.dp)) {
+                    Text(
+                        "Answer",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        streamingAnswer,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            }
         }
 
         Spacer(Modifier.height(10.dp))

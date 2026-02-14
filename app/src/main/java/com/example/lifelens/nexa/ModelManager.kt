@@ -1,6 +1,8 @@
 package com.example.lifelens.nexa
 
 import android.content.Context
+import android.os.Environment
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -121,7 +123,157 @@ class ModelManager(private val context: Context) {
         return false
     }
 
+    /**
+     * Paths to check for pre-deployed model files (via adb push).
+     *
+     * Primary (recommended — no permissions needed):
+     *   adb shell mkdir -p /sdcard/Android/data/com.example.lifelens/files/models/OmniNeural-4B-mobile
+     *   adb push *.nexa /sdcard/Android/data/com.example.lifelens/files/models/OmniNeural-4B-mobile/
+     */
+    private fun externalModelDirs(spec: ModelSpec): List<File> = listOfNotNull(
+        // Primary: app's own external files dir (no permissions needed)
+        context.getExternalFilesDir(null)?.let { File(it, "models/${spec.id}") },
+        // Fallback: /sdcard/LifeLens/models/<id>/
+        File(Environment.getExternalStorageDirectory(), "LifeLens/models/${spec.id}")
+    )
+
+    /**
+     * Check if model files were pre-deployed to external storage (via adb push).
+     * Returns the directory containing all model files, or null if not found.
+     */
+    private fun findExternalModel(spec: ModelSpec): File? {
+        for (dir in externalModelDirs(spec)) {
+            if (!dir.exists()) continue
+            val allPresent = spec.files.all { name ->
+                val f = File(dir, name)
+                f.exists() && f.length() > 0L && !isBadDownloadedFile(f)
+            }
+            if (allPresent) {
+                Log.i(TAG, "Found pre-deployed model at: ${dir.absolutePath}")
+                return dir
+            }
+        }
+        return null
+    }
+
+    /**
+     * Copy model files from external storage (adb push location) to internal storage.
+     */
+    fun copyExternalModel(spec: ModelSpec, sourceDir: File): Flow<DownloadProgress> = flow {
+        val dir = modelDir(spec)
+        if (!dir.exists()) dir.mkdirs()
+
+        val fileCount = spec.files.size
+        emit(DownloadProgress(spec.id, "(copying from device)", 0, fileCount, 0L, 100L, 0))
+
+        spec.files.forEachIndexed { idx, fileName ->
+            val outFile = File(dir, fileName)
+            val srcFile = File(sourceDir, fileName)
+
+            if (outFile.exists() && outFile.length() > 0L && !isBadDownloadedFile(outFile)) {
+                emit(DownloadProgress(spec.id, fileName, idx + 1, fileCount, 0L, 100L,
+                    ((idx + 1) * 100 / fileCount).coerceIn(0, 100)))
+                return@forEachIndexed
+            }
+
+            srcFile.inputStream().use { input ->
+                FileOutputStream(outFile).use { output ->
+                    val buf = ByteArray(1024 * 256)
+                    while (true) {
+                        val read = input.read(buf)
+                        if (read <= 0) break
+                        output.write(buf, 0, read)
+                    }
+                }
+            }
+
+            emit(DownloadProgress(spec.id, fileName, idx + 1, fileCount, 0L, 100L,
+                ((idx + 1) * 100 / fileCount).coerceIn(0, 100)))
+        }
+
+        val entry = File(dir, spec.entryFile)
+        require(entry.exists() && entry.length() > 0L) {
+            "Entry file missing after copy: ${entry.absolutePath}"
+        }
+
+        emit(DownloadProgress(spec.id, "(done)", fileCount, fileCount, 100L, 100L, 100))
+    }.flowOn(Dispatchers.IO)
+
+    private fun hasBundledAssets(spec: ModelSpec): Boolean {
+        return try {
+            val assetPath = "models/${spec.id}"
+            val listed = context.assets.list(assetPath) ?: emptyArray()
+            spec.files.all { it in listed }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun copyBundledModel(spec: ModelSpec): Flow<DownloadProgress> = flow {
+        val dir = modelDir(spec)
+        if (!dir.exists()) dir.mkdirs()
+
+        val fileCount = spec.files.size
+
+        emit(DownloadProgress(spec.id, "(preparing)", 0, fileCount, 0L, 100L, 0))
+
+        spec.files.forEachIndexed { idx, fileName ->
+            val outFile = File(dir, fileName)
+
+            if (outFile.exists() && outFile.length() > 0L && !isBadDownloadedFile(outFile)) {
+                emit(DownloadProgress(spec.id, fileName, idx + 1, fileCount, 0L, 100L,
+                    ((idx + 1) * 100 / fileCount).coerceIn(0, 100)))
+                return@forEachIndexed
+            }
+
+            val assetPath = "models/${spec.id}/$fileName"
+            context.assets.open(assetPath).use { input ->
+                FileOutputStream(outFile).use { output ->
+                    val buf = ByteArray(1024 * 256)
+                    while (true) {
+                        val read = input.read(buf)
+                        if (read <= 0) break
+                        output.write(buf, 0, read)
+                    }
+                }
+            }
+
+            emit(DownloadProgress(spec.id, fileName, idx + 1, fileCount, 0L, 100L,
+                ((idx + 1) * 100 / fileCount).coerceIn(0, 100)))
+        }
+
+        val entry = File(dir, spec.entryFile)
+        require(entry.exists() && entry.length() > 0L) {
+            "Entry file missing after asset copy: ${entry.absolutePath}"
+        }
+
+        emit(DownloadProgress(spec.id, "(done)", fileCount, fileCount, 100L, 100L, 100))
+    }.flowOn(Dispatchers.IO)
+
     fun downloadModel(spec: ModelSpec): Flow<DownloadProgress> = flow {
+        // 1) Check if model already exists in internal storage
+        if (isModelReady(spec)) {
+            Log.i(TAG, "Model already ready in internal storage")
+            emit(DownloadProgress(spec.id, "(done)", spec.files.size, spec.files.size, 100L, 100L, 100))
+            return@flow
+        }
+
+        // 2) Check for pre-deployed model on external storage (via adb push)
+        val externalDir = findExternalModel(spec)
+        if (externalDir != null) {
+            Log.i(TAG, "Copying pre-deployed model from: ${externalDir.absolutePath}")
+            copyExternalModel(spec, externalDir).collect { emit(it) }
+            return@flow
+        }
+
+        // 3) Use bundled assets if available (no internet needed)
+        if (hasBundledAssets(spec)) {
+            copyBundledModel(spec).collect { emit(it) }
+            return@flow
+        }
+
+        // 4) Fall back to HTTP download from Hugging Face
+
         val dir = modelDir(spec)
         if (!dir.exists()) dir.mkdirs()
 
@@ -295,5 +447,9 @@ class ModelManager(private val context: Context) {
             offset += read
         }
         return if (offset == n) buffer else buffer.copyOf(offset)
+    }
+
+    companion object {
+        private const val TAG = "ModelManager"
     }
 }
