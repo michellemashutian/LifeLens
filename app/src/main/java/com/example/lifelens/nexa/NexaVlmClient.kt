@@ -14,7 +14,10 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
 import java.io.File
+
+private val manifestJson = Json { ignoreUnknownKeys = true }
 
 class NexaVlmClient(
     private val context: Context,
@@ -62,22 +65,50 @@ class NexaVlmClient(
             Log.w(TAG, "No mmproj_path provided — image analysis may not work")
         }
 
-        // 5) Load model with the requested plugin
-        val pluginsToTry = listOf(pluginId)
+        // 5) Read nexa.manifest for ModelName and effective plugin (align with nexa-sdk-examples)
+        val manifest = modelDir?.let { dir ->
+            runCatching {
+                val f = File(dir, "nexa.manifest")
+                if (f.exists() && f.isFile) manifestJson.decodeFromString<NexaManifestBean>(f.bufferedReader().use { it.readText() }) else null
+            }.getOrNull()
+        }
+        val modelName = manifest?.ModelName?.ifBlank { null } ?: "omni-neural"
+        val effectivePluginId = manifest?.PluginId ?: pluginId
+        Log.d(TAG, "Manifest: modelName=$modelName, effectivePluginId=$effectivePluginId")
+
+        // 6) Load model with config matching nexa-sdk-examples (NPU needs npu_lib_folder_path / npu_model_folder_path)
+        val pluginsToTry = listOf(effectivePluginId)
 
         var lastError: Throwable? = null
         for (pid in pluginsToTry) {
             Log.d(TAG, "Trying to load model with plugin_id=$pid...")
             try {
+                val config = if (pid == "npu" && modelDir != null) {
+                    ModelConfig(
+                        nCtx = 2048,
+                        nThreads = 8,
+                        enable_thinking = false,
+                        npu_lib_folder_path = context.applicationInfo.nativeLibraryDir,
+                        npu_model_folder_path = modelDir.absolutePath
+                    )
+                } else {
+                    ModelConfig(
+                        nCtx = 1024,
+                        nThreads = 4,
+                        nBatch = 1,
+                        nUBatch = 1,
+                        nGpuLayers = 0,
+                        enable_thinking = false
+                    )
+                }
+
                 val input = VlmCreateInput(
-                    model_name = "omni-neural",
+                    model_name = modelName,
                     model_path = entryFile.absolutePath,
                     mmproj_path = mmprojPath,
-                    config = ModelConfig(
-                        max_tokens = 2048,
-                        enable_thinking = false
-                    ),
-                    plugin_id = pid
+                    config = config,
+                    plugin_id = pid,
+                    device_id = "HTP0"
                 )
 
                 val result = VlmWrapper.builder()

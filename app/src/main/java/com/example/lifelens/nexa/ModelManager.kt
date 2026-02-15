@@ -13,7 +13,10 @@ import okhttp3.Response
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import kotlinx.serialization.json.Json
 import kotlin.math.max
+
+private val manifestJson = Json { ignoreUnknownKeys = true }
 
 data class ModelSpec(
     val id: String,
@@ -67,6 +70,15 @@ class ModelManager(private val context: Context) {
 
     fun defaultSpec(): ModelSpec = models.first()
     fun modelDir(spec: ModelSpec): File = File(context.filesDir, "models/${spec.id}")
+
+    fun getNexaManifest(spec: ModelSpec): NexaManifestBean? {
+        return runCatching {
+            val manifestFile = File(modelDir(spec), "nexa.manifest")
+            if (!manifestFile.exists() || !manifestFile.isFile) return@runCatching null
+            val str = manifestFile.bufferedReader().use { it.readText() }
+            manifestJson.decodeFromString<NexaManifestBean>(str)
+        }.getOrNull()
+    }
     fun entryPath(spec: ModelSpec): String = File(modelDir(spec), spec.entryFile).absolutePath
     fun mmprojPath(spec: ModelSpec): String? = spec.mmprojFile?.let { File(modelDir(spec), it).absolutePath }
     fun defaultEntryPath(): String = entryPath(defaultSpec())
