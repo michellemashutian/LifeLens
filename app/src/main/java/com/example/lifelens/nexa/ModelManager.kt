@@ -1,10 +1,11 @@
 package com.example.lifelens.nexa
 
+import android.content.Context
 import android.os.Environment
 import android.util.Log
-import android.content.Context
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import okhttp3.OkHttpClient
@@ -13,7 +14,10 @@ import okhttp3.Response
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import kotlinx.serialization.json.Json
 import kotlin.math.max
+
+private val manifestJson = Json { ignoreUnknownKeys = true }
 
 data class ModelSpec(
     val id: String,
@@ -60,12 +64,23 @@ class ModelManager(private val context: Context) {
                 "weights-7-8.nexa",
                 "weights-8-8.nexa"
             ),
-            entryFile = "files-1-1.nexa"
+            entryFile = "files-1-1.nexa",
+            mmprojFile = "attachments-1-3.nexa"
         )
     )
 
     fun defaultSpec(): ModelSpec = models.first()
     fun modelDir(spec: ModelSpec): File = File(context.filesDir, "models/${spec.id}")
+
+    fun getNexaManifest(spec: ModelSpec): NexaManifestBean? {
+        return runCatching {
+            val manifestFile = File(modelDir(spec), "nexa.manifest")
+            if (!manifestFile.exists() || !manifestFile.isFile) return@runCatching null
+            val str = manifestFile.bufferedReader().use { it.readText() }
+            manifestJson.decodeFromString<NexaManifestBean>(str)
+        }.getOrNull()
+    }
+
     fun entryPath(spec: ModelSpec): String = File(modelDir(spec), spec.entryFile).absolutePath
     fun mmprojPath(spec: ModelSpec): String? = spec.mmprojFile?.let { File(modelDir(spec), it).absolutePath }
     fun defaultEntryPath(): String = entryPath(defaultSpec())
@@ -122,7 +137,147 @@ class ModelManager(private val context: Context) {
         return false
     }
 
+    /**
+     * Paths to check for pre-deployed model files (via adb push).
+     *
+     * Primary (recommended — no permissions needed):
+     *   adb shell mkdir -p /sdcard/Android/data/com.example.lifelens/files/models/OmniNeural-4B-mobile
+     *   adb push *.nexa /sdcard/Android/data/com.example.lifelens/files/models/OmniNeural-4B-mobile/
+     */
+    private fun externalModelDirs(spec: ModelSpec): List<File> = listOfNotNull(
+        context.getExternalFilesDir(null)?.let { File(it, "models/${spec.id}") },
+        File(Environment.getExternalStorageDirectory(), "LifeLens/models/${spec.id}")
+    )
+
+    private fun findExternalModel(spec: ModelSpec): File? {
+        for (dir in externalModelDirs(spec)) {
+            if (!dir.exists()) continue
+            val allPresent = spec.files.all { name ->
+                val f = File(dir, name)
+                f.exists() && f.length() > 0L && !isBadDownloadedFile(f)
+            }
+            if (allPresent) {
+                Log.i(TAG, "Found pre-deployed model at: ${dir.absolutePath}")
+                return dir
+            }
+        }
+        return null
+    }
+
+    fun copyExternalModel(spec: ModelSpec, sourceDir: File): Flow<DownloadProgress> = flow {
+        val dir = modelDir(spec)
+        if (!dir.exists()) dir.mkdirs()
+
+        val fileCount = spec.files.size
+        emit(DownloadProgress(spec.id, "(copying from device)", 0, fileCount, 0L, 100L, 0))
+
+        spec.files.forEachIndexed { idx, fileName ->
+            val outFile = File(dir, fileName)
+            val srcFile = File(sourceDir, fileName)
+
+            if (outFile.exists() && outFile.length() > 0L && !isBadDownloadedFile(outFile)) {
+                emit(DownloadProgress(spec.id, fileName, idx + 1, fileCount, 0L, 100L,
+                    ((idx + 1) * 100 / fileCount).coerceIn(0, 100)))
+                return@forEachIndexed
+            }
+
+            srcFile.inputStream().use { input ->
+                FileOutputStream(outFile).use { output ->
+                    val buf = ByteArray(1024 * 256)
+                    while (true) {
+                        val read = input.read(buf)
+                        if (read <= 0) break
+                        output.write(buf, 0, read)
+                    }
+                }
+            }
+
+            emit(DownloadProgress(spec.id, fileName, idx + 1, fileCount, 0L, 100L,
+                ((idx + 1) * 100 / fileCount).coerceIn(0, 100)))
+        }
+
+        val entry = File(dir, spec.entryFile)
+        require(entry.exists() && entry.length() > 0L) {
+            "Entry file missing after copy: ${entry.absolutePath}"
+        }
+
+        emit(DownloadProgress(spec.id, "(done)", fileCount, fileCount, 100L, 100L, 100))
+    }.flowOn(Dispatchers.IO)
+
+    private fun hasBundledAssets(spec: ModelSpec): Boolean {
+        return try {
+            val assetPath = "models/${spec.id}"
+            val listed = context.assets.list(assetPath) ?: emptyArray()
+            spec.files.all { it in listed }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun copyBundledModel(spec: ModelSpec): Flow<DownloadProgress> = flow {
+        val dir = modelDir(spec)
+        if (!dir.exists()) dir.mkdirs()
+
+        val fileCount = spec.files.size
+        emit(DownloadProgress(spec.id, "(preparing)", 0, fileCount, 0L, 100L, 0))
+
+        spec.files.forEachIndexed { idx, fileName ->
+            val outFile = File(dir, fileName)
+
+            if (outFile.exists() && outFile.length() > 0L && !isBadDownloadedFile(outFile)) {
+                emit(DownloadProgress(spec.id, fileName, idx + 1, fileCount, 0L, 100L,
+                    ((idx + 1) * 100 / fileCount).coerceIn(0, 100)))
+                return@forEachIndexed
+            }
+
+            val assetPath = "models/${spec.id}/$fileName"
+            context.assets.open(assetPath).use { input ->
+                FileOutputStream(outFile).use { output ->
+                    val buf = ByteArray(1024 * 256)
+                    while (true) {
+                        val read = input.read(buf)
+                        if (read <= 0) break
+                        output.write(buf, 0, read)
+                    }
+                }
+            }
+
+            emit(DownloadProgress(spec.id, fileName, idx + 1, fileCount, 0L, 100L,
+                ((idx + 1) * 100 / fileCount).coerceIn(0, 100)))
+        }
+
+        val entry = File(dir, spec.entryFile)
+        require(entry.exists() && entry.length() > 0L) {
+            "Entry file missing after asset copy: ${entry.absolutePath}"
+        }
+
+        emit(DownloadProgress(spec.id, "(done)", fileCount, fileCount, 100L, 100L, 100))
+    }.flowOn(Dispatchers.IO)
+
     fun downloadModel(spec: ModelSpec): Flow<DownloadProgress> = flow {
+        // 1) already ready
+        if (isModelReady(spec)) {
+            Log.i(TAG, "Model already ready in internal storage")
+            emit(DownloadProgress(spec.id, "(done)", spec.files.size, spec.files.size, 100L, 100L, 100))
+            return@flow
+        }
+
+        // 2) external pre-deployed
+        val externalDir = findExternalModel(spec)
+        if (externalDir != null) {
+            Log.i(TAG, "Copying pre-deployed model from: ${externalDir.absolutePath}")
+            copyExternalModel(spec, externalDir).collect { emit(it) }
+            return@flow
+        }
+
+        // 3) bundled assets
+        if (hasBundledAssets(spec)) {
+            Log.i(TAG, "Copying bundled assets model...")
+            copyBundledModel(spec).collect { emit(it) }
+            return@flow
+        }
+
+        // 4) http download
         val dir = modelDir(spec)
         if (!dir.exists()) dir.mkdirs()
 
@@ -134,37 +289,19 @@ class ModelManager(private val context: Context) {
             if (f.exists() && f.length() > 0L && !isBadDownloadedFile(f)) f.length() else 0L
         }
 
-        emit(
-            DownloadProgress(
-                modelId = spec.id,
-                fileName = "(prepare)",
-                fileIndex = 0,
-                fileCount = spec.files.size,
-                bytesDownloaded = downloadedAll,
-                bytesTotal = totalAll,
-                overallPercent = ((downloadedAll * 100) / totalAll).toInt().coerceIn(0, 100)
-            )
+        emit(DownloadProgress(spec.id, "(prepare)", 0, spec.files.size, downloadedAll, totalAll,
+            ((downloadedAll * 100) / totalAll).toInt().coerceIn(0, 100))
         )
 
         spec.files.forEachIndexed { idx, fileName ->
             val outFile = File(dir, fileName)
             val partFile = File(dir, "$fileName.part")
 
-            if (outFile.exists() && isBadDownloadedFile(outFile)) {
-                outFile.delete()
-            }
+            if (outFile.exists() && isBadDownloadedFile(outFile)) outFile.delete()
 
             if (outFile.exists() && outFile.length() > 0L) {
-                emit(
-                    DownloadProgress(
-                        modelId = spec.id,
-                        fileName = fileName,
-                        fileIndex = idx + 1,
-                        fileCount = spec.files.size,
-                        bytesDownloaded = downloadedAll,
-                        bytesTotal = totalAll,
-                        overallPercent = ((downloadedAll * 100) / totalAll).toInt().coerceIn(0, 100)
-                    )
+                emit(DownloadProgress(spec.id, fileName, idx + 1, spec.files.size, downloadedAll, totalAll,
+                    ((downloadedAll * 100) / totalAll).toInt().coerceIn(0, 100))
                 )
                 return@forEachIndexed
             }
@@ -190,7 +327,6 @@ class ModelManager(private val context: Context) {
                         validateResponseOrThrow(resp, fileName, url)
 
                         val body = resp.body ?: throw IllegalStateException("Empty body: $fileName")
-
                         val ctype = (resp.header("Content-Type") ?: "").lowercase()
                         if (ctype.contains("text/html")) {
                             throw IllegalStateException("Got HTML for $fileName (code=${resp.code}, contentType=$ctype)")
@@ -208,28 +344,23 @@ class ModelManager(private val context: Context) {
                                 fileDownloadedThisAttempt += read
 
                                 val overall = (((downloadedAll + resumeFrom + fileDownloadedThisAttempt) * 100) / totalAll)
-                                    .toInt()
-                                    .coerceIn(0, 100)
+                                    .toInt().coerceIn(0, 100)
 
-                                emit(
-                                    DownloadProgress(
-                                        modelId = spec.id,
-                                        fileName = fileName,
-                                        fileIndex = idx + 1,
-                                        fileCount = spec.files.size,
-                                        bytesDownloaded = downloadedAll + resumeFrom + fileDownloadedThisAttempt,
-                                        bytesTotal = totalAll,
-                                        overallPercent = overall
-                                    )
-                                )
+                                emit(DownloadProgress(
+                                    modelId = spec.id,
+                                    fileName = fileName,
+                                    fileIndex = idx + 1,
+                                    fileCount = spec.files.size,
+                                    bytesDownloaded = downloadedAll + resumeFrom + fileDownloadedThisAttempt,
+                                    bytesTotal = totalAll,
+                                    overallPercent = overall
+                                ))
                             }
                         }
                     }
 
                     if (outFile.exists()) outFile.delete()
-                    if (!partFile.renameTo(outFile)) {
-                        throw IllegalStateException("Failed to rename .part for $fileName")
-                    }
+                    if (!partFile.renameTo(outFile)) throw IllegalStateException("Failed to rename .part for $fileName")
 
                     if (isBadDownloadedFile(outFile)) {
                         outFile.delete()
@@ -242,16 +373,12 @@ class ModelManager(private val context: Context) {
                 } catch (t: Throwable) {
                     resumeFrom = if (partFile.exists()) partFile.length() else 0L
                     if (attempt >= maxRetry) {
-                        throw IllegalStateException(
-                            "Download failed after $maxRetry attempts: $fileName. ${t.message}",
-                            t
-                        )
+                        throw IllegalStateException("Download failed after $maxRetry attempts: $fileName. ${t.message}", t)
                     }
                 }
             }
         }
 
-        // ✅ 最终校验：entry 必须存在
         val entry = File(dir, spec.entryFile)
         require(entry.exists() && entry.length() > 0L) {
             "Entry file missing after download: ${entry.absolutePath}"
@@ -262,17 +389,7 @@ class ModelManager(private val context: Context) {
             throw IllegalStateException("Missing/invalid files after download: ${missing.joinToString()}")
         }
 
-        emit(
-            DownloadProgress(
-                modelId = spec.id,
-                fileName = "(done)",
-                fileIndex = spec.files.size,
-                fileCount = spec.files.size,
-                bytesDownloaded = totalAll,
-                bytesTotal = totalAll,
-                overallPercent = 100
-            )
-        )
+        emit(DownloadProgress(spec.id, "(done)", spec.files.size, spec.files.size, totalAll, totalAll, 100))
     }.flowOn(Dispatchers.IO)
 
     private fun validateResponseOrThrow(resp: Response, fileName: String, url: String) {
@@ -281,9 +398,7 @@ class ModelManager(private val context: Context) {
         if (!ok) {
             val ctype = resp.header("Content-Type") ?: ""
             val loc = resp.header("Location") ?: ""
-            throw IllegalStateException(
-                "HTTP $code for $fileName (contentType=$ctype, location=$loc, url=$url)"
-            )
+            throw IllegalStateException("HTTP $code for $fileName (contentType=$ctype, location=$loc, url=$url)")
         }
     }
 
@@ -296,5 +411,9 @@ class ModelManager(private val context: Context) {
             offset += read
         }
         return if (offset == n) buffer else buffer.copyOf(offset)
+    }
+
+    companion object {
+        private const val TAG = "ModelManager"
     }
 }

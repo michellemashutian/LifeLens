@@ -7,113 +7,141 @@ import com.nexa.sdk.VlmWrapper
 import com.nexa.sdk.bean.GenerationConfig
 import com.nexa.sdk.bean.LlmStreamResult
 import com.nexa.sdk.bean.ModelConfig
+import com.nexa.sdk.bean.VlmChatMessage
+import com.nexa.sdk.bean.VlmContent
 import com.nexa.sdk.bean.VlmCreateInput
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import java.io.File
 
 class NexaVlmClient(
     private val context: Context,
-    private val modelPath: String,   // ✅ 必须是 files-1-1.nexa 的绝对路径
-    private val pluginId: String     // ✅ "npu" or "cpu_gpu"
+    private val modelName: String,
+    private val pluginId: String,              // "npu" or "cpu_gpu"
+    private val modelFilePath: String,         // .../files-*.nexa
+    private val modelDirPath: String,          // .../OmniNeural-4B-mobile
+    private val npuLibFolderPath: String? = null // applicationInfo.nativeLibraryDir
 ) {
+    companion object { private const val TAG = "NexaVlmClient" }
 
-    private var vlmWrapper: VlmWrapper? = null
-
-    val activePluginId: String get() = pluginId
-
-    suspend fun init() = withContext(Dispatchers.IO) {
-        val plugin = pluginId.trim().lowercase()
-        require(plugin == "npu" || plugin == "cpu_gpu") {
-            "Invalid pluginId=$pluginId. Use \"npu\" or \"cpu_gpu\"."
-        }
-
-        NexaSdk.getInstance().init(context)
-
-        val entryFile = File(modelPath)
-        require(entryFile.exists() && entryFile.isFile && entryFile.length() > 0L) {
-            "Model entry file not found: ${entryFile.absolutePath}"
-        }
-
-        Log.d(TAG, "init(): entry=${entryFile.absolutePath} len=${entryFile.length()} plugin=$plugin")
-
-        val input = VlmCreateInput(
-            model_name = "omni-neural", // ✅ 与 nexa.manifest 一致
-            model_path = entryFile.absolutePath,
-            config = ModelConfig(
-                max_tokens = 512,          // ✅ 先小一点，排除资源问题；跑通后再调大
-                enable_thinking = false
-            ),
-            plugin_id = plugin
-        )
-
-
-        // ✅ build() 返回 Result：失败直接抛异常，外面 Setup 会显示
-        vlmWrapper = VlmWrapper.builder()
-            .vlmCreateInput(input)
-            .build()
-            .getOrThrow()
-
-        Log.d(TAG, "init(): Model loaded OK (plugin=$plugin)")
-    }
+    private var wrapper: VlmWrapper? = null
 
     /**
-     * 传入：prompt + imagePath
-     * 输出：token stream
+     * Load model.
      */
+    suspend fun init(
+        nCtx: Int = 2048,
+        nThreads: Int = 8,
+        enableThinking: Boolean = false
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            // ✅ 注意：不同版本 init() 可能返回 Int，但我们不关心返回值
+            NexaSdk.getInstance().init(context)
 
-    fun generateWithImageStream(prompt: String, imagePath: String): Flow<String> = flow {
-        val wrapper = vlmWrapper ?: error("Model not initialized. Call init() first.")
+            val modelFile = File(modelFilePath)
+            require(modelFile.exists() && modelFile.isFile && modelFile.length() > 0L) {
+                "modelFile not found/empty: $modelFilePath"
+            }
+
+            val modelDir = File(modelDirPath)
+            require(modelDir.exists() && modelDir.isDirectory) {
+                "modelDir not found/not dir: $modelDirPath"
+            }
+
+            Log.i(TAG, "init(): modelName=$modelName pluginId=$pluginId")
+            Log.i(TAG, "init(): modelFile=$modelFilePath (${modelFile.length()} bytes)")
+            Log.i(TAG, "init(): modelDir=$modelDirPath")
+            Log.i(TAG, "init(): npuLibFolderPath=$npuLibFolderPath")
+
+            val config = if (pluginId == "npu") {
+                ModelConfig(
+                    nCtx = nCtx,
+                    nThreads = nThreads,
+                    enable_thinking = enableThinking,
+                    npu_lib_folder_path = npuLibFolderPath,
+                    npu_model_folder_path = modelDirPath
+                    // ✅ device_id 这个字段你当前 SDK 没有，删掉
+                )
+            } else {
+                ModelConfig(
+                    nCtx = 1024,
+                    nThreads = 4,
+                    nBatch = 1,
+                    nUBatch = 1,
+                    enable_thinking = enableThinking
+                )
+            }
+
+            val input = VlmCreateInput(
+                model_name = modelName,
+                model_path = modelFilePath,
+                mmproj_path = null,      // ✅ 不需要 mmproj 就保持 null
+                config = config,
+                plugin_id = pluginId
+            )
+
+            wrapper = VlmWrapper.builder()
+                .vlmCreateInput(input)
+                .build()
+                .getOrElse { throw it }
+
+            Log.i(TAG, "init(): Model loaded OK")
+
+            // ✅ 强制让 runCatching 返回 Unit，避免 Result<Int> / Result<Something>
+            Unit
+        }
+    }
+
+    fun isReady(): Boolean = wrapper != null
+
+    /**
+     * Stream tokens for (image + prompt).
+     */
+    fun generateWithImageStream(imagePath: String, prompt: String): Flow<String> = flow {
+        val w = requireNotNull(wrapper) { "VLM not initialized. Call init() first." }
+
         val img = File(imagePath)
-        require(img.exists() && img.isFile && img.length() > 0L) { "Image not found: $imagePath" }
+        require(img.exists() && img.isFile && img.length() > 0L) { "Image not found/empty: $imagePath" }
 
-        Log.d(TAG, "generateWithImageStream(): plugin=$pluginId img=${img.absolutePath} (${img.length()} bytes)")
+        Log.i(TAG, "generateWithImageStream(): plugin=$pluginId img=${img.absolutePath} (${img.length()} bytes)")
+        Log.i(TAG, "generateWithImageStream(): prompt=${prompt.take(300)}")
 
-        val cfg = GenerationConfig(
-            imagePaths = arrayOf(img.absolutePath),
-            imageCount = 1
+        val messages = arrayOf(
+            VlmChatMessage(
+                role = "user",
+                contents = listOf(
+                    VlmContent("image", img.absolutePath),
+                    VlmContent("text", prompt)
+                )
+            )
         )
 
-        wrapper.generateStreamFlow(prompt, cfg).collect { r ->
+        val baseConfig = GenerationConfig()
+        val configWithMedia = w.injectMediaPathsToConfig(messages, baseConfig)
+
+        w.generateStreamFlow(prompt, configWithMedia).collect { r ->
             when (r) {
                 is LlmStreamResult.Token -> emit(r.text)
-
-                is LlmStreamResult.Completed -> {
-                    Log.d(TAG, "generateWithImageStream(): Completed")
-                }
-
-                is LlmStreamResult.Error -> {
-                    val t = r.throwable
-                    Log.e(TAG, "generateWithImageStream(): SDK Error object=$r")
-                    Log.e(TAG, "generateWithImageStream(): throwable=${t?.javaClass?.name} msg=${t?.message}", t)
-                    Log.e(TAG, "generateWithImageStream(): cause=${t?.cause?.javaClass?.name} causeMsg=${t?.cause?.message}", t?.cause)
-
-                    // ✅ 把 message 原样抛出去（里面通常带 error_code）
-                    throw RuntimeException("VLM generate failed: ${t?.message ?: r.toString()}", t)
-                }
+                is LlmStreamResult.Completed -> Log.i(TAG, "completed")
+                is LlmStreamResult.Error -> throw r.throwable
             }
         }
-    }.flowOn(Dispatchers.IO)
-
-
-    suspend fun destroy() = withContext(Dispatchers.IO) {
-        Log.d(TAG, "destroy()")
-        try { vlmWrapper?.stopStream() } catch (_: Throwable) {}
-        try { vlmWrapper?.destroy() } catch (_: Throwable) {}
-        vlmWrapper = null
     }
 
-    private fun extractErrorCode(msg: String): Int? {
-        // 常见格式：
-        // "VLM generate failed, error code: -457230920"
-        val regex = Regex("""error\s*code\s*:\s*(-?\d+)""", RegexOption.IGNORE_CASE)
-        return regex.find(msg)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    suspend fun reset(): Result<Int> = withContext(Dispatchers.IO) {
+        runCatching { requireNotNull(wrapper).reset() }
     }
 
-    companion object {
-        private const val TAG = "NexaVlmClient"
+    suspend fun stopStream(): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { requireNotNull(wrapper).stopStream().getOrThrow() }
+    }
+
+    fun destroy(): Result<Int> = runCatching {
+        val w = wrapper
+        wrapper = null
+        w?.destroy() ?: 0
     }
 }

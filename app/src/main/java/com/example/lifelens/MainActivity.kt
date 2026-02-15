@@ -20,30 +20,32 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.exifinterface.media.ExifInterface
 import com.example.lifelens.camera.takePhoto
 import com.example.lifelens.nexa.ModelManager
 import com.example.lifelens.nexa.NexaVlmClient
 import com.example.lifelens.tool.Audience
 import com.example.lifelens.ui.theme.LifeLensTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
-import androidx.compose.ui.graphics.asImageBitmap
-
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
 
 enum class Phase { INTRO, SETUP, READY }
 
@@ -89,11 +91,9 @@ class MainActivity : ComponentActivity() {
                             Build.DEVICE.contains("generic", true) ||
                             Build.PRODUCT.contains("sdk", true)
                 }
-                // default plugin: emulator -> cpu, device -> npu
-                // var pluginId by remember { mutableStateOf(if (isEmulator) "cpu" else "npu") }
 
-                var pluginId by remember { mutableStateOf("npu") }
-                // var pluginId by remember { mutableStateOf("cpu_gpu") }
+                // default plugin: emulator -> cpu_gpu, device -> npu
+                var pluginId by remember { mutableStateOf(if (isEmulator) "cpu_gpu" else "npu") }
 
                 // camera
                 val previewView = remember { PreviewView(context) }
@@ -103,7 +103,6 @@ class MainActivity : ComponentActivity() {
                 // model
                 val modelManager = remember { ModelManager(context) }
                 val spec = remember { modelManager.defaultSpec() }
-                val modelPath by remember(spec.id) { mutableStateOf(modelManager.entryPath(spec)) }
                 var modelReady by remember { mutableStateOf(false) }
 
                 // nexa
@@ -122,7 +121,7 @@ class MainActivity : ComponentActivity() {
                     onDispose { scope.launch { runCatching { activeClient?.destroy() } } }
                 }
 
-                // Upload photo -> copy to cache -> store absolute path
+                // Upload photo -> copy to cache -> prepare for VLM -> store absolute path
                 val uploadLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.GetContent()
                 ) { uri: Uri? ->
@@ -133,19 +132,19 @@ class MainActivity : ComponentActivity() {
                             detail = "Copying uploaded photo."
                             progress = null
 
-                            val outFile = File(context.cacheDir, "upload_${System.currentTimeMillis()}.jpg")
-                            copyUriToFile(context.contentResolver, uri, outFile)
-                            require(outFile.exists() && outFile.length() > 0L) { "Uploaded file is empty" }
+                            val rawFile = File(context.cacheDir, "upload_raw_${System.currentTimeMillis()}.jpg")
+                            copyUriToFile(context.contentResolver, uri, rawFile)
+                            require(rawFile.exists() && rawFile.length() > 0L) { "Uploaded file is empty" }
 
-                            uploadedImagePath = outFile.absolutePath
+                            // ✅ prepare for VLM
+                            val prepared = prepareImageForVlm(context, rawFile.absolutePath, maxSize = 448, squareCrop = true)
+                            uploadedImagePath = prepared
 
-                            if (questionText.isBlank()) {
-                                questionText = defaultQuestion(audience)
-                            }
+                            if (questionText.isBlank()) questionText = defaultQuestion(audience)
 
                             headline = "Image ready"
-                            detail = "Tap Send or Quick Test."
-                            Log.d("LifeLens", "Uploaded image: ${outFile.absolutePath} (${outFile.length()} bytes)")
+                            detail = "Tap Ask or Quick Test."
+                            Log.d("LifeLens", "Uploaded prepared image: $prepared (${File(prepared).length()} bytes)")
                         }.onFailure {
                             headline = "Upload failed"
                             detail = it.message ?: "Unknown error"
@@ -178,43 +177,54 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-
                 suspend fun createAndInitClient(pid: String): Result<NexaVlmClient> =
                     withContext(Dispatchers.IO) {
                         runCatching {
-                            // ✅ 只允许 npu / cpu_gpu
-                            val plugin = pid.trim().lowercase()
-                            require(plugin == "npu" || plugin == "cpu_gpu") {
+                            val requested = pid.trim().lowercase()
+                            require(requested == "npu" || requested == "cpu_gpu") {
                                 "Invalid pluginId=$pid. Use \"npu\" or \"cpu_gpu\"."
                             }
 
-                            // ✅ entry file：files-1-1.nexa
+                            // ✅ emulator 强制 cpu_gpu
+                            val effectivePlugin = if (isEmulator) "cpu_gpu" else requested
+
+                            // ✅ 读取 manifest（你原本就有）
+                            val manifest = modelManager.getNexaManifest(spec)
+
+                            // ✅ modelName：优先用 manifest 里的 ModelName，否则 fallback
+                            val modelName = manifest?.ModelName?.takeIf { it.isNotBlank() }
+                                ?: spec.id // 或者写死 "omni-neural" 也行，但用 manifest 更稳
+
+                            // ✅ 路径：entryPath 是你 model list 里的主文件（files-*.nexa）
+                            val modelDir = modelManager.modelDir(spec)
                             val entryPath = modelManager.entryPath(spec)
+
+                            // ✅ sanity check
+                            val dir = File(modelDir.absolutePath)
                             val entry = File(entryPath)
+                            require(dir.exists() && dir.isDirectory) { "Model dir missing: ${dir.absolutePath}" }
+                            require(entry.exists() && entry.isFile && entry.length() > 0L) { "Model file missing/empty: ${entry.absolutePath}" }
 
-                            Log.d("LifeLens", "createAndInitClient(plugin=$plugin)")
-                            Log.d(
-                                "LifeLens",
-                                "entryPath=$entryPath exists=${entry.exists()} isFile=${entry.isFile} len=${entry.length()}"
-                            )
+                            Log.i("LifeLens", "createAndInitClient(): requested=$requested effective=$effectivePlugin")
+                            Log.i("LifeLens", "createAndInitClient(): modelName=$modelName")
+                            Log.i("LifeLens", "createAndInitClient(): modelDir=${dir.absolutePath}")
+                            Log.i("LifeLens", "createAndInitClient(): modelFile=${entry.absolutePath} len=${entry.length()}")
 
-                            require(entry.exists() && entry.isFile && entry.length() > 0L) {
-                                "Model entry file missing: ${entry.absolutePath}"
-                            }
-
-                            val c = NexaVlmClient(
+                            val client = NexaVlmClient(
                                 context = context,
-                                modelPath = entry.absolutePath,   // ✅ 只传 entry 文件
-                                pluginId = plugin                // ✅ "npu" or "cpu_gpu"
+                                modelName = modelName,
+                                pluginId = effectivePlugin,
+                                modelFilePath = entry.absolutePath,
+                                modelDirPath = dir.absolutePath,
+                                npuLibFolderPath = applicationInfo.nativeLibraryDir
                             )
 
-                            c.init()
-                            c
+                            // ✅ init() 返回 Result<Unit>，直接 getOrThrow()
+                            client.init().getOrThrow()
+
+                            client
                         }
                     }
-
-
-
 
 
                 fun handleAskWithImage() {
@@ -236,10 +246,14 @@ class MainActivity : ComponentActivity() {
                                 headline = "Capturing..."
                                 detail = q
 
-                                val photoFile = File(context.cacheDir, "ask_capture_${System.currentTimeMillis()}.jpg")
-                                val captured = takePhoto(context, imageCapture, photoFile)
+                                val raw = File(context.cacheDir, "ask_capture_raw_${System.currentTimeMillis()}.jpg")
+                                val captured = takePhoto(context, imageCapture, raw)
                                 require(captured.exists() && captured.length() > 0L) { "Captured image is empty" }
-                                captured.absolutePath
+
+                                // ✅ prepare for VLM
+                                val prepared = prepareImageForVlm(context, captured.absolutePath, maxSize = 448, squareCrop = true)
+                                uploadedImagePath = prepared
+                                prepared
                             }
 
                             val prompt = buildPrompt(audience, q)
@@ -248,7 +262,9 @@ class MainActivity : ComponentActivity() {
                             detail = q
                             Log.d("LifeLens", "Ask with image=$imagePath plugin=$pluginId")
 
-                            client.generateWithImageStream(prompt, imagePath).collect { token ->
+                            // ✅ IMPORTANT: matches your NexaVlmClient signature
+                            // generateWithImageStream(imagePath, prompt)
+                            client.generateWithImageStream(imagePath, prompt).collect { token ->
                                 streamingAnswer += token
                             }
 
@@ -270,18 +286,17 @@ class MainActivity : ComponentActivity() {
 
                     scope.launch {
                         isProcessing = true
-
                         runCatching {
                             val client = activeClient ?: error("Model not initialized. Tap Get Started first.")
 
                             headline = "Loading default image..."
                             detail = "Preparing test..."
 
-                            val path = copyAssetToCache(context, "default_test.jpg")
-                            uploadedImagePath = path
+                            val raw = copyAssetToCache(context, "default_test.jpg")
+                            val prepared = prepareImageForVlm(context, raw, maxSize = 448, squareCrop = true)
+                            uploadedImagePath = prepared
 
                             questionText = defaultQuestion(audience)
-
                             streamingAnswer = ""
 
                             val prompt = buildPrompt(audience, questionText)
@@ -289,7 +304,7 @@ class MainActivity : ComponentActivity() {
                             headline = "Thinking..."
                             detail = questionText
 
-                            client.generateWithImageStream(prompt, path).collect { token ->
+                            client.generateWithImageStream(prepared, prompt).collect { token ->
                                 streamingAnswer += token
                             }
 
@@ -300,7 +315,6 @@ class MainActivity : ComponentActivity() {
                             headline = "Quick test failed"
                             detail = it.message ?: "Unknown error"
                         }
-
                         isProcessing = false
                     }
                 }
@@ -337,18 +351,33 @@ class MainActivity : ComponentActivity() {
                                 if (!modelReady) error("Download incomplete. Missing: ${missingAfter.joinToString()}")
                             }
 
-                            // 3) init
+                            // 3) init: try cpu_gpu first, then npu
                             headline = "Initializing..."
-                            detail = if (pluginId == "npu") "Starting on NPU…" else "Starting on CPU/GPU…"
+                            detail = "Trying CPU/GPU…"
                             progress = null
 
-                            val r = createAndInitClient(pluginId)
-                            if (r.isSuccess) {
-                                runCatching { activeClient?.destroy() }
-                                activeClient = r.getOrThrow()
-                            } else {
-                                throw r.exceptionOrNull() ?: RuntimeException("Init failed (unknown)")
+                            val tryOrder = listOf("cpu_gpu", "npu")
+                            var lastError: Throwable? = null
+                            var okClient: NexaVlmClient? = null
+
+                            for (pid in tryOrder) {
+                                val r = createAndInitClient(pid)
+                                if (r.isSuccess) {
+                                    okClient = r.getOrThrow()
+                                    pluginId = pid
+                                    break
+                                } else {
+                                    lastError = r.exceptionOrNull()
+                                    Log.e("LifeLens", "Init failed for plugin=$pid", lastError)
+                                }
                             }
+
+                            if (okClient == null) throw (lastError ?: RuntimeException("Init failed for all plugins"))
+
+                            runCatching { activeClient?.destroy() }
+                            activeClient = okClient
+
+                            detail = if (pluginId == "npu") "Started on NPU." else "Started on CPU/GPU."
 
                             // 4) camera
                             headline = "Almost ready"
@@ -381,85 +410,76 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-
                 Surface(modifier = Modifier.fillMaxSize()) {
                     when (phase) {
-                        Phase.INTRO -> {
-                            IntroScreen(
-                                title = "LifeLens",
-                                subtitle = "Understand what you see.\nMade for Elderly & Kids.",
-                                primaryText = if (setupRunning) "Starting…" else "Get Started",
-                                onPrimary = { startSetup() }
-                            )
+                        Phase.INTRO -> IntroScreen(
+                            title = "LifeLens",
+                            subtitle = "Understand what you see.\nMade for Elderly & Kids.",
+                            primaryText = if (setupRunning) "Starting…" else "Get Started",
+                            onPrimary = { startSetup() }
+                        )
 
-                        }
+                        Phase.SETUP -> SetupScreen(
+                            headline = headline,
+                            detail = detail,
+                            progress = progress,
+                            errorText = setupError,
+                            running = setupRunning,
+                            onRetry = { startSetup() },
+                            onBack = {
+                                if (!setupRunning) {
+                                    phase = Phase.INTRO
+                                    headline = "Welcome to LifeLens"
+                                    detail = "One-tap setup, then point and understand."
+                                    progress = null
+                                    setupError = null
+                                }
+                            }
+                        )
 
-                        Phase.SETUP -> {
-                            SetupScreen(
-                                headline = headline,
-                                detail = detail,
-                                progress = progress,
-                                errorText = setupError,
-                                running = setupRunning,
-                                onRetry = { startSetup() },
-                                onBack = {
-                                    if (!setupRunning) {
-                                        phase = Phase.INTRO
-                                        headline = "Welcome to LifeLens"
-                                        detail = "One-tap setup, then point and understand."
-                                        progress = null
-                                        setupError = null
+                        Phase.READY -> ReadyScreen(
+                            previewView = previewView,
+                            cameraGranted = cameraGranted,
+                            uploadedImagePath = uploadedImagePath,
+                            cameraReady = cameraReady,
+                            hasUploadedImage = uploadedImagePath != null,
+                            onRequestCamera = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
+                            onBindCamera = { bindCamera() },
+                            audience = audience,
+                            onAudienceChange = {
+                                audience = it
+                                if (questionText.isBlank()) questionText = defaultQuestion(audience)
+                            },
+                            onUpload = { uploadLauncher.launch("image/*") },
+                            onCapture = {
+                                scope.launch {
+                                    runCatching {
+                                        if (!(cameraGranted && cameraReady)) error("Camera not ready")
+                                        val raw = File(context.cacheDir, "capture_raw_${System.currentTimeMillis()}.jpg")
+                                        val captured = takePhoto(context, imageCapture, raw)
+                                        require(captured.exists() && captured.length() > 0L) { "Captured image is empty" }
+
+                                        val prepared = prepareImageForVlm(context, captured.absolutePath, maxSize = 448, squareCrop = true)
+                                        uploadedImagePath = prepared
+
+                                        if (questionText.isBlank()) questionText = defaultQuestion(audience)
+                                        headline = "Image ready"
+                                        detail = "Type a question and tap Ask."
+                                    }.onFailure {
+                                        headline = "Capture failed"
+                                        detail = it.message ?: "Unknown error"
                                     }
                                 }
-                            )
-                        }
-
-                        Phase.READY -> {
-                            ReadyScreen(
-                                previewView = previewView,
-                                cameraGranted = cameraGranted,
-                                uploadedImagePath = uploadedImagePath,
-                                cameraReady = cameraReady,
-                                hasUploadedImage = uploadedImagePath != null,
-                                onRequestCamera = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
-                                onBindCamera = { bindCamera() },
-                                audience = audience,
-                                onAudienceChange = {
-                                    audience = it
-                                    // if user hasn't typed anything, update default question when switching audience
-                                    if (questionText.isBlank()) questionText = defaultQuestion(audience)
-                                },
-                                onUpload = { uploadLauncher.launch("image/*") },
-                                onCapture = {
-                                    scope.launch {
-                                        runCatching {
-                                            if (!(cameraGranted && cameraReady)) error("Camera not ready")
-                                            val photoFile = File(context.cacheDir, "capture_${System.currentTimeMillis()}.jpg")
-                                            val captured = takePhoto(context, imageCapture, photoFile)
-                                            require(captured.exists() && captured.length() > 0L) { "Captured image is empty" }
-                                            uploadedImagePath = captured.absolutePath
-                                            if (questionText.isBlank()) questionText = defaultQuestion(audience)
-                                            headline = "Image ready"
-                                            detail = "Type a question and tap Send."
-                                        }.onFailure {
-                                            headline = "Capture failed"
-                                            detail = it.message ?: "Unknown error"
-                                        }
-                                    }
-                                },
-                                headline = headline,
-                                detail = detail,
-                                questionText = questionText,
-                                onQuestionTextChange = { questionText = it },
-                                isProcessing = isProcessing,
-                                streamingAnswer = streamingAnswer,
-                                onAskSubmit = { handleAskWithImage() },
-                                onQuickTest = {
-                                    // mark processing here to prevent double taps
-                                    quickTestDefaultPhoto()
-                                }
-                            )
-                        }
+                            },
+                            headline = headline,
+                            detail = detail,
+                            questionText = questionText,
+                            onQuestionTextChange = { questionText = it },
+                            isProcessing = isProcessing,
+                            streamingAnswer = streamingAnswer,
+                            onAskSubmit = { handleAskWithImage() },
+                            onQuickTest = { quickTestDefaultPhoto() }
+                        )
                     }
                 }
             }
@@ -522,8 +542,6 @@ private fun IntroScreen(
         }
     }
 }
-
-
 
 @Composable
 private fun SetupScreen(
@@ -605,7 +623,6 @@ private fun ReadyScreen(
     onAskSubmit: () -> Unit,
     onQuickTest: () -> Unit
 ) {
-
     val scroll = rememberScrollState()
 
     Column(
@@ -637,7 +654,6 @@ private fun ReadyScreen(
 
         Spacer(Modifier.height(12.dp))
 
-        // Camera Preview
         Card(shape = RoundedCornerShape(20.dp)) {
             Box(
                 modifier = Modifier
@@ -667,37 +683,22 @@ private fun ReadyScreen(
 
         Spacer(Modifier.height(12.dp))
 
-// ✅ Loaded Image Preview
         if (hasUploadedImage && uploadedImagePath != null) {
-
-            val f = remember(uploadedImagePath) { File(uploadedImagePath) }
-
             Card(shape = RoundedCornerShape(20.dp)) {
                 Column(Modifier.padding(12.dp)) {
-
                     Text(
                         "Loaded Image",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold
                     )
-
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        "Photo loaded",
-                        style = MaterialTheme.typography.bodySmall
-                    )
                     Spacer(Modifier.height(8.dp))
 
                     val bitmap = remember(uploadedImagePath) {
-                        android.graphics.BitmapFactory.decodeFile(uploadedImagePath)
+                        BitmapFactory.decodeFile(uploadedImagePath)
                     }
 
                     if (bitmap == null) {
-                        Text(
-                            "Failed to decode image.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
+                        Text("Failed to decode image.", color = MaterialTheme.colorScheme.error)
                     } else {
                         androidx.compose.foundation.Image(
                             bitmap = bitmap.asImageBitmap(),
@@ -709,11 +710,8 @@ private fun ReadyScreen(
                     }
                 }
             }
-
             Spacer(Modifier.height(12.dp))
         }
-
-
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Button(
@@ -761,9 +759,7 @@ private fun ReadyScreen(
                     enabled = questionText.isNotBlank() && !isProcessing &&
                             (hasUploadedImage || (cameraGranted && cameraReady)),
                     modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Ask")
-                }
+                ) { Text("Ask") }
 
                 if (isProcessing) {
                     Spacer(Modifier.height(8.dp))
@@ -795,7 +791,6 @@ private fun ReadyScreen(
     }
 }
 
-
 @Composable
 private fun OverlayHint(
     title: String,
@@ -826,17 +821,13 @@ private fun OverlayHint(
 
 private fun defaultQuestion(audience: Audience): String {
     return when (audience) {
-        Audience.ELDERLY ->
-            "What is this object? What is it used for? Are there any safety concerns?"
-        Audience.CHILD ->
-            "What is this? What does it do? Is it safe to use?"
+        Audience.ELDERLY -> "What is this object? What is it used for? Are there any safety concerns?"
+        Audience.CHILD -> "What is this? What does it do? Is it safe to use?"
     }
 }
 
 private fun buildPrompt(audience: Audience, userQuestion: String): String {
-
     val system = when (audience) {
-
         Audience.ELDERLY -> """
 You are LifeLens, an offline assistant designed for elderly users.
 
@@ -863,7 +854,6 @@ Rules:
 
     return system + "\n\nUser question: " + userQuestion.trim()
 }
-
 
 private suspend fun copyUriToFile(resolver: ContentResolver, uri: Uri, outFile: File) {
     withContext(Dispatchers.IO) {
@@ -896,3 +886,116 @@ private suspend fun copyAssetToCache(context: android.content.Context, assetName
         require(outFile.exists() && outFile.length() > 0L) { "Asset copy failed: $assetName" }
         outFile.absolutePath
     }
+
+/**
+ * ✅ 把任意图片文件处理成 VLM 更稳定的输入：
+ * - 修正 EXIF 旋转
+ * - 缩放到 <= maxSize（默认 448）
+ * - 可选：正方形 center-crop（更稳）
+ * - 输出到 cacheDir，返回新的 absolutePath
+ */
+private suspend fun prepareImageForVlm(
+    context: android.content.Context,
+    srcPath: String,
+    maxSize: Int = 448,
+    squareCrop: Boolean = true
+): String = withContext(Dispatchers.IO) {
+
+    val srcFile = File(srcPath)
+    require(srcFile.exists() && srcFile.length() > 0L) { "Image not found or empty: $srcPath" }
+
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(srcFile.absolutePath, bounds)
+    require(bounds.outWidth > 0 && bounds.outHeight > 0) { "Failed to read image bounds: $srcPath" }
+
+    val sample = computeInSampleSize(bounds.outWidth, bounds.outHeight, maxSize, maxSize)
+    val opts = BitmapFactory.Options().apply {
+        inJustDecodeBounds = false
+        inSampleSize = sample
+        inPreferredConfig = Bitmap.Config.ARGB_8888
+    }
+
+    var bmp = BitmapFactory.decodeFile(srcFile.absolutePath, opts)
+        ?: throw IllegalStateException("Failed to decode image: $srcPath")
+
+    val rotated = applyExifRotationIfNeeded(srcFile.absolutePath, bmp)
+    if (rotated !== bmp) {
+        bmp.recycle()
+        bmp = rotated
+    }
+
+    val scaled = scaleDownToMax(bmp, maxSize)
+    if (scaled !== bmp) {
+        bmp.recycle()
+        bmp = scaled
+    }
+
+    val finalBmp = if (squareCrop) {
+        val cropped = centerCropSquare(bmp)
+        if (cropped !== bmp) bmp.recycle()
+        cropped
+    } else bmp
+
+    val outFile = File(context.cacheDir, "vlm_${System.currentTimeMillis()}.jpg")
+    FileOutputStream(outFile).use { fos ->
+        finalBmp.compress(Bitmap.CompressFormat.JPEG, 90, fos)
+    }
+    finalBmp.recycle()
+
+    require(outFile.exists() && outFile.length() > 0L) { "Prepared image is empty" }
+    outFile.absolutePath
+}
+
+private fun computeInSampleSize(w: Int, h: Int, reqW: Int, reqH: Int): Int {
+    var inSampleSize = 1
+    val halfW = w / 2
+    val halfH = h / 2
+    while (halfW / inSampleSize >= reqW && halfH / inSampleSize >= reqH) {
+        inSampleSize *= 2
+    }
+    return inSampleSize.coerceAtLeast(1)
+}
+
+private fun applyExifRotationIfNeeded(path: String, bitmap: Bitmap): Bitmap {
+    return try {
+        val exif = ExifInterface(path)
+        val orientation = exif.getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL
+        )
+        val degrees = when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270
+            else -> 0
+        }
+        if (degrees == 0) bitmap
+        else {
+            val m = Matrix().apply { postRotate(degrees.toFloat()) }
+            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, m, true)
+        }
+    } catch (_: Exception) {
+        bitmap
+    }
+}
+
+private fun scaleDownToMax(src: Bitmap, maxSize: Int): Bitmap {
+    val w = src.width
+    val h = src.height
+    val maxSide = maxOf(w, h)
+    if (maxSide <= maxSize) return src
+    val scale = maxSize.toFloat() / maxSide.toFloat()
+    val nw = (w * scale).toInt().coerceAtLeast(1)
+    val nh = (h * scale).toInt().coerceAtLeast(1)
+    return Bitmap.createScaledBitmap(src, nw, nh, true)
+}
+
+private fun centerCropSquare(src: Bitmap): Bitmap {
+    val w = src.width
+    val h = src.height
+    val side = minOf(w, h)
+    val x = (w - side) / 2
+    val y = (h - side) / 2
+    return if (x == 0 && y == 0 && side == w && side == h) src
+    else Bitmap.createBitmap(src, x, y, side, side)
+}
