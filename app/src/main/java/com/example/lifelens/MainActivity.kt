@@ -90,10 +90,10 @@ class MainActivity : ComponentActivity() {
                             Build.PRODUCT.contains("sdk", true)
                 }
                 // default plugin: emulator -> cpu, device -> npu
-                // var pluginId by remember { mutableStateOf(if (isEmulator) "cpu" else "npu") }
+                //var pluginId by remember { mutableStateOf(if (isEmulator) "cpu" else "npu") }
 
                 var pluginId by remember { mutableStateOf("npu") }
-                // var pluginId by remember { mutableStateOf("cpu_gpu") }
+//                var pluginId by remember { mutableStateOf("cpu_gpu") }
 
                 // camera
                 val previewView = remember { PreviewView(context) }
@@ -178,7 +178,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-
                 suspend fun createAndInitClient(pid: String): Result<NexaVlmClient> =
                     withContext(Dispatchers.IO) {
                         runCatching {
@@ -212,9 +211,6 @@ class MainActivity : ComponentActivity() {
                             c
                         }
                     }
-
-
-
 
 
                 fun handleAskWithImage() {
@@ -380,6 +376,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+
 
 
                 Surface(modifier = Modifier.fillMaxSize()) {

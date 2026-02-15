@@ -63,13 +63,14 @@ class NexaVlmClient(
      * 传入：prompt + imagePath
      * 输出：token stream
      */
-
     fun generateWithImageStream(prompt: String, imagePath: String): Flow<String> = flow {
         val wrapper = vlmWrapper ?: error("Model not initialized. Call init() first.")
+
         val img = File(imagePath)
         require(img.exists() && img.isFile && img.length() > 0L) { "Image not found: $imagePath" }
 
         Log.d(TAG, "generateWithImageStream(): plugin=$pluginId img=${img.absolutePath} (${img.length()} bytes)")
+        Log.d(TAG, "generateWithImageStream(): promptLen=${prompt.length}")
 
         val cfg = GenerationConfig(
             imagePaths = arrayOf(img.absolutePath),
@@ -81,22 +82,24 @@ class NexaVlmClient(
                 is LlmStreamResult.Token -> emit(r.text)
 
                 is LlmStreamResult.Completed -> {
-                    Log.d(TAG, "generateWithImageStream(): Completed")
+                    // no-op
                 }
 
                 is LlmStreamResult.Error -> {
-                    val t = r.throwable
-                    Log.e(TAG, "generateWithImageStream(): SDK Error object=$r")
-                    Log.e(TAG, "generateWithImageStream(): throwable=${t?.javaClass?.name} msg=${t?.message}", t)
-                    Log.e(TAG, "generateWithImageStream(): cause=${t?.cause?.javaClass?.name} causeMsg=${t?.cause?.message}", t?.cause)
+                    // ✅ 把 errorCode 单独抽出来（方便你发 issue）
+                    val msg = r.throwable?.message ?: r.toString()
+                    val code = extractErrorCode(msg)
+                    Log.e(TAG, "VLM generate failed. errorCode=$code raw=$msg")
+                    throw RuntimeException("VLM generate failed, errorCode=$code, raw=$msg", r.throwable)
+                }
 
-                    // ✅ 把 message 原样抛出去（里面通常带 error_code）
-                    throw RuntimeException("VLM generate failed: ${t?.message ?: r.toString()}", t)
+                else -> {
+                    // 如果 SDK 以后加了新类型，避免 silent
+                    Log.w(TAG, "Unknown stream result: $r")
                 }
             }
         }
     }.flowOn(Dispatchers.IO)
-
 
     suspend fun destroy() = withContext(Dispatchers.IO) {
         Log.d(TAG, "destroy()")
