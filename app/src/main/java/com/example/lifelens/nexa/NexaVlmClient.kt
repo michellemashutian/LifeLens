@@ -50,6 +50,7 @@ class NexaVlmClient(
             plugin_id = plugin
         )
 
+
         // ✅ build() 返回 Result：失败直接抛异常，外面 Setup 会显示
         vlmWrapper = VlmWrapper.builder()
             .vlmCreateInput(input)
