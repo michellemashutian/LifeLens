@@ -20,6 +20,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,15 +35,15 @@ import androidx.core.content.ContextCompat
 import com.example.lifelens.camera.takePhoto
 import com.example.lifelens.nexa.ModelManager
 import com.example.lifelens.nexa.NexaVlmClient
-import com.example.lifelens.tool.*
+import com.example.lifelens.tool.Audience
 import com.example.lifelens.ui.theme.LifeLensTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.SerializationException
-import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.FileOutputStream
+import androidx.compose.ui.graphics.asImageBitmap
+
 
 enum class Phase { INTRO, SETUP, READY }
 
@@ -77,7 +79,7 @@ class MainActivity : ComponentActivity() {
                     contract = ActivityResultContracts.RequestPermission()
                 ) { granted -> cameraGranted = granted }
 
-                // emulator detect (keep your original logic)
+                // emulator detect
                 val isEmulator = remember {
                     Build.FINGERPRINT.contains("generic", true) ||
                             Build.FINGERPRINT.contains("emulator", true) ||
@@ -87,6 +89,7 @@ class MainActivity : ComponentActivity() {
                             Build.DEVICE.contains("generic", true) ||
                             Build.PRODUCT.contains("sdk", true)
                 }
+                // default plugin: emulator -> cpu, device -> npu
                 var pluginId by remember { mutableStateOf(if (isEmulator) "cpu" else "npu") }
 
                 // camera
@@ -96,41 +99,52 @@ class MainActivity : ComponentActivity() {
 
                 // model
                 val modelManager = remember { ModelManager(context) }
-                val spec = remember { modelManager.models.first() }
+                val spec = remember { modelManager.defaultSpec() }
                 val modelPath by remember(spec.id) { mutableStateOf(modelManager.entryPath(spec)) }
                 var modelReady by remember { mutableStateOf(false) }
 
                 // nexa
-                var nexaReady by remember { mutableStateOf(false) }
                 var activeClient by remember { mutableStateOf<NexaVlmClient?>(null) }
+
+                // Ask-with-image states
+                var uploadedImagePath by remember { mutableStateOf<String?>(null) }
+                var questionText by remember { mutableStateOf("") }
+                var isProcessing by remember { mutableStateOf(false) }
+                var streamingAnswer by remember { mutableStateOf("") }
+
+                // audience
+                var audience by remember { mutableStateOf(Audience.ELDERLY) }
 
                 DisposableEffect(Unit) {
                     onDispose { scope.launch { runCatching { activeClient?.destroy() } } }
                 }
 
-                // tools (kept, but demo test won't use them)
-                val knowledgeServer = remember { KnowledgeServer(context) }
-                val safetyServer = remember { SafetyServer() }
-                val actionServer = remember { ActionServer(context) }
-                val toolRouter = remember { ToolRouter(knowledgeServer, safetyServer, actionServer) }
-
-                var audience by remember { mutableStateOf(Audience.ELDERLY) }
-                var rawOutput by remember { mutableStateOf("") }
-                var detect by remember { mutableStateOf<VisionDetectResult?>(null) }
-                var bundle by remember { mutableStateOf<ToolBundle?>(null) }
-
-                // Upload photo (kept, but we won't call describeImage in demo mode)
+                // Upload photo -> copy to cache -> store absolute path
                 val uploadLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.GetContent()
                 ) { uri: Uri? ->
                     if (uri == null) return@rememberLauncherForActivityResult
                     scope.launch {
                         runCatching {
-                            headline = "Not supported"
-                            detail = "Demo mode: use Test button (text generation)."
+                            headline = "Loading image..."
+                            detail = "Copying uploaded photo."
                             progress = null
+
+                            val outFile = File(context.cacheDir, "upload_${System.currentTimeMillis()}.jpg")
+                            copyUriToFile(context.contentResolver, uri, outFile)
+                            require(outFile.exists() && outFile.length() > 0L) { "Uploaded file is empty" }
+
+                            uploadedImagePath = outFile.absolutePath
+
+                            if (questionText.isBlank()) {
+                                questionText = defaultQuestion(audience)
+                            }
+
+                            headline = "Image ready"
+                            detail = "Tap Send or Quick Test."
+                            Log.d("LifeLens", "Uploaded image: ${outFile.absolutePath} (${outFile.length()} bytes)")
                         }.onFailure {
-                            headline = "Failed"
+                            headline = "Upload failed"
                             detail = it.message ?: "Unknown error"
                         }
                     }
@@ -156,12 +170,11 @@ class MainActivity : ComponentActivity() {
                         }.onFailure {
                             cameraReady = false
                             headline = "Camera not ready"
-                            detail = "If emulator preview is black: Emulator → Settings → Camera → Back/Front = Webcam0."
+                            detail = "If emulator preview is black: Emulator → Settings → Camera → Webcam0."
                         }
                     }
                 }
 
-                // ✅ demo init: do not pass mmproj, do not do describeImage
                 suspend fun createAndInitClient(pid: String): Result<NexaVlmClient> = withContext(Dispatchers.IO) {
                     runCatching {
                         val entryPath = modelManager.entryPath(spec)
@@ -176,10 +189,99 @@ class MainActivity : ComponentActivity() {
 
                         val c = NexaVlmClient(
                             context = context,
-                            modelPath = entryPath
+                            modelPath = entryPath,
+                            pluginId = pid
                         )
                         c.init()
                         c
+                    }
+                }
+
+                fun handleAskWithImage() {
+                    val q = questionText.trim()
+                    if (q.isBlank() || isProcessing) return
+
+                    scope.launch {
+                        isProcessing = true
+                        streamingAnswer = ""
+
+                        try {
+                            val client = activeClient ?: error("Model not initialized. Tap Get Started first.")
+
+                            // imagePath: uploaded first, otherwise capture
+                            val imagePath: String = uploadedImagePath ?: run {
+                                if (!(cameraGranted && cameraReady)) {
+                                    error("No image yet. Please Upload Photo, or use Quick Test.")
+                                }
+                                headline = "Capturing..."
+                                detail = q
+
+                                val photoFile = File(context.cacheDir, "ask_capture_${System.currentTimeMillis()}.jpg")
+                                val captured = takePhoto(context, imageCapture, photoFile)
+                                require(captured.exists() && captured.length() > 0L) { "Captured image is empty" }
+                                captured.absolutePath
+                            }
+
+                            val prompt = buildPrompt(audience, q)
+
+                            headline = "Thinking..."
+                            detail = q
+                            Log.d("LifeLens", "Ask with image=$imagePath plugin=$pluginId")
+
+                            client.generateWithImageStream(prompt, imagePath).collect { token ->
+                                streamingAnswer += token
+                            }
+
+                            headline = "Answer"
+                            detail = q
+                        } catch (t: Throwable) {
+                            Log.e("LifeLens", "Ask failed", t)
+                            headline = "Failed"
+                            detail = t.message ?: "Unknown error"
+                            if (streamingAnswer.isBlank()) streamingAnswer = "Error: ${t.message ?: "Unknown"}"
+                        } finally {
+                            isProcessing = false
+                        }
+                    }
+                }
+
+                fun quickTestDefaultPhoto() {
+                    if (isProcessing) return
+
+                    scope.launch {
+                        isProcessing = true
+
+                        runCatching {
+                            val client = activeClient ?: error("Model not initialized. Tap Get Started first.")
+
+                            headline = "Loading default image..."
+                            detail = "Preparing test..."
+
+                            val path = copyAssetToCache(context, "default_test.jpg")
+                            uploadedImagePath = path
+
+                            questionText = defaultQuestion(audience)
+
+                            streamingAnswer = ""
+
+                            val prompt = buildPrompt(audience, questionText)
+
+                            headline = "Thinking..."
+                            detail = questionText
+
+                            client.generateWithImageStream(prompt, path).collect { token ->
+                                streamingAnswer += token
+                            }
+
+                            headline = "Answer"
+                            detail = questionText
+
+                        }.onFailure {
+                            headline = "Quick test failed"
+                            detail = it.message ?: "Unknown error"
+                        }
+
+                        isProcessing = false
                     }
                 }
 
@@ -195,13 +297,6 @@ class MainActivity : ComponentActivity() {
                             headline = "Checking model..."
                             detail = "Looking for local model files."
                             progress = null
-
-                            Log.d("LifeLens", "spec.id=${spec.id}")
-                            Log.d("LifeLens", "modelDir=${modelManager.modelDir(spec).absolutePath}")
-                            Log.d("LifeLens", "entryPath(modelPath)=$modelPath")
-
-                            val entry = File(modelPath)
-                            Log.d("LifeLens", "entry exists=${entry.exists()} isFile=${entry.isFile} len=${entry.length()}")
 
                             val missing = modelManager.missingFiles(spec)
                             modelReady = missing.isEmpty()
@@ -222,7 +317,7 @@ class MainActivity : ComponentActivity() {
                                 if (!modelReady) error("Download incomplete. Missing: ${missingAfter.joinToString()}")
                             }
 
-                            // 3) init (NO CPU fallback)
+                            // 3) init
                             headline = "Initializing..."
                             detail = if (pluginId == "cpu") "Starting on CPU…" else "Starting on NPU…"
                             progress = null
@@ -231,25 +326,21 @@ class MainActivity : ComponentActivity() {
                             if (r1.isSuccess) {
                                 runCatching { activeClient?.destroy() }
                                 activeClient = r1.getOrNull()
-                                nexaReady = true
                             } else {
-                                val e1 = r1.exceptionOrNull()
-                                Log.e("LifeLens", "Init failed for plugin=$pluginId", e1)
-                                throw e1 ?: RuntimeException("Init failed (unknown)")
+                                throw r1.exceptionOrNull() ?: RuntimeException("Init failed (unknown)")
                             }
 
-                            // 4) camera permission + bind (optional)
+                            // 4) camera
                             headline = "Almost ready"
                             detail = "We’ll ask for camera permission so you can capture."
                             progress = null
-
                             if (!cameraGranted) cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
                             bindCamera()
 
                             // 5) ready
                             phase = Phase.READY
                             headline = "Ready"
-                            detail = "Tap Test to run the official demo prompt."
+                            detail = "Upload or Capture, ask a question, or run Quick Test."
                             progress = null
                         } catch (t: Throwable) {
                             setupError = buildString {
@@ -280,10 +371,9 @@ class MainActivity : ComponentActivity() {
                                 title = "LifeLens",
                                 subtitle = "Understand what you see.\nMade for Elderly & Kids.",
                                 primaryText = if (setupRunning) "Starting…" else "Get Started",
-                                secondaryText = "Upload a photo",
-                                onPrimary = { startSetup() },
-                                onSecondary = { uploadLauncher.launch("image/*") }
+                                onPrimary = { startSetup() }
                             )
+
                         }
 
                         Phase.SETUP -> {
@@ -310,43 +400,46 @@ class MainActivity : ComponentActivity() {
                             ReadyScreen(
                                 previewView = previewView,
                                 cameraGranted = cameraGranted,
+                                uploadedImagePath = uploadedImagePath,
                                 cameraReady = cameraReady,
+                                hasUploadedImage = uploadedImagePath != null,
                                 onRequestCamera = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
                                 onBindCamera = { bindCamera() },
                                 audience = audience,
-                                onAudienceChange = { audience = it },
+                                onAudienceChange = {
+                                    audience = it
+                                    // if user hasn't typed anything, update default question when switching audience
+                                    if (questionText.isBlank()) questionText = defaultQuestion(audience)
+                                },
                                 onUpload = { uploadLauncher.launch("image/*") },
                                 onCapture = {
                                     scope.launch {
-                                        headline = "Not supported"
-                                        detail = "Demo mode: use Test button (text generation)."
-                                    }
-                                },
-                                onTestText = {
-                                    scope.launch {
                                         runCatching {
-                                            val client = activeClient ?: error("Model not initialized. Tap Get Started first.")
-                                            headline = "Generating..."
-                                            detail = "Who are you?"
-                                            progress = null
-
-                                            val out = client.generate("Who are you?")
-                                            rawOutput = out
-
-                                            headline = "Done"
-                                            detail = "Text generation finished."
+                                            if (!(cameraGranted && cameraReady)) error("Camera not ready")
+                                            val photoFile = File(context.cacheDir, "capture_${System.currentTimeMillis()}.jpg")
+                                            val captured = takePhoto(context, imageCapture, photoFile)
+                                            require(captured.exists() && captured.length() > 0L) { "Captured image is empty" }
+                                            uploadedImagePath = captured.absolutePath
+                                            if (questionText.isBlank()) questionText = defaultQuestion(audience)
+                                            headline = "Image ready"
+                                            detail = "Type a question and tap Send."
                                         }.onFailure {
-                                            headline = "Failed"
+                                            headline = "Capture failed"
                                             detail = it.message ?: "Unknown error"
                                         }
                                     }
                                 },
                                 headline = headline,
                                 detail = detail,
-                                rawOutput = rawOutput,
-                                detect = detect,
-                                bundle = bundle,
-                                actionServer = actionServer
+                                questionText = questionText,
+                                onQuestionTextChange = { questionText = it },
+                                isProcessing = isProcessing,
+                                streamingAnswer = streamingAnswer,
+                                onAskSubmit = { handleAskWithImage() },
+                                onQuickTest = {
+                                    // mark processing here to prevent double taps
+                                    quickTestDefaultPhoto()
+                                }
                             )
                         }
                     }
@@ -363,9 +456,7 @@ private fun IntroScreen(
     title: String,
     subtitle: String,
     primaryText: String,
-    secondaryText: String,
-    onPrimary: () -> Unit,
-    onSecondary: () -> Unit
+    onPrimary: () -> Unit
 ) {
     Box(
         modifier = Modifier
@@ -377,14 +468,20 @@ private fun IntroScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(title, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.SemiBold)
+            Text(
+                title,
+                style = MaterialTheme.typography.headlineLarge,
+                fontWeight = FontWeight.SemiBold
+            )
+
             Spacer(Modifier.height(10.dp))
+
             Text(
                 subtitle,
                 style = MaterialTheme.typography.bodyLarge,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(horizontal = 12.dp)
+                textAlign = TextAlign.Center
             )
+
             Spacer(Modifier.height(28.dp))
 
             Button(
@@ -393,28 +490,22 @@ private fun IntroScreen(
                     .fillMaxWidth()
                     .height(56.dp),
                 shape = RoundedCornerShape(16.dp)
-            ) { Text(primaryText) }
-
-            Spacer(Modifier.height(12.dp))
-
-            OutlinedButton(
-                onClick = onSecondary,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(52.dp),
-                shape = RoundedCornerShape(16.dp)
-            ) { Text(secondaryText) }
+            ) {
+                Text(primaryText)
+            }
 
             Spacer(Modifier.height(16.dp))
+
             Text(
                 "Tip: The first run downloads the on-device model.",
                 style = MaterialTheme.typography.bodySmall,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(horizontal = 12.dp)
+                textAlign = TextAlign.Center
             )
         }
     }
 }
+
+
 
 @Composable
 private fun SetupScreen(
@@ -426,17 +517,9 @@ private fun SetupScreen(
     onRetry: () -> Unit,
     onBack: () -> Unit
 ) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(20.dp),
-        contentAlignment = Alignment.Center
-    ) {
+    Box(modifier = Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp)
-            ) {
+            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
                 Column(modifier = Modifier.padding(18.dp)) {
                     Text(headline, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(10.dp))
@@ -455,16 +538,9 @@ private fun SetupScreen(
                         Spacer(Modifier.height(14.dp))
                         Divider()
                         Spacer(Modifier.height(12.dp))
-                        Text(
-                            "Error details",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
+                        Text("Error details", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(6.dp))
-                        Text(
-                            errorText,
-                            style = MaterialTheme.typography.bodySmall
-                        )
+                        Text(errorText, style = MaterialTheme.typography.bodySmall)
                         Spacer(Modifier.height(14.dp))
 
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -494,20 +570,24 @@ private fun ReadyScreen(
     previewView: PreviewView,
     cameraGranted: Boolean,
     cameraReady: Boolean,
+    hasUploadedImage: Boolean,
+    uploadedImagePath: String?,
     onRequestCamera: () -> Unit,
     onBindCamera: () -> Unit,
     audience: Audience,
     onAudienceChange: (Audience) -> Unit,
     onUpload: () -> Unit,
     onCapture: () -> Unit,
-    onTestText: () -> Unit,
     headline: String,
     detail: String,
-    rawOutput: String,
-    detect: VisionDetectResult?,
-    bundle: ToolBundle?,
-    actionServer: ActionServer
+    questionText: String,
+    onQuestionTextChange: (String) -> Unit,
+    isProcessing: Boolean,
+    streamingAnswer: String,
+    onAskSubmit: () -> Unit,
+    onQuickTest: () -> Unit
 ) {
+
     val scroll = rememberScrollState()
 
     Column(
@@ -516,11 +596,13 @@ private fun ReadyScreen(
             .verticalScroll(scroll)
             .padding(16.dp)
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("LifeLens", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "LifeLens",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.SemiBold
+            )
             Spacer(Modifier.weight(1f))
             FilterChip(
                 selected = audience == Audience.ELDERLY,
@@ -537,6 +619,7 @@ private fun ReadyScreen(
 
         Spacer(Modifier.height(12.dp))
 
+        // Camera Preview
         Card(shape = RoundedCornerShape(20.dp)) {
             Box(
                 modifier = Modifier
@@ -544,15 +627,12 @@ private fun ReadyScreen(
                     .height(320.dp)
                     .background(MaterialTheme.colorScheme.surfaceVariant)
             ) {
-                AndroidView(
-                    factory = { previewView },
-                    modifier = Modifier.fillMaxSize()
-                )
+                AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
 
                 if (!cameraGranted) {
                     OverlayHint(
                         title = "Camera permission needed",
-                        subtitle = "You can still upload a photo without camera.",
+                        subtitle = "You can still upload or use Quick Test.",
                         primary = "Grant",
                         onPrimary = onRequestCamera
                     )
@@ -569,57 +649,136 @@ private fun ReadyScreen(
 
         Spacer(Modifier.height(12.dp))
 
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+// ✅ Loaded Image Preview
+        if (hasUploadedImage && uploadedImagePath != null) {
+
+            val f = remember(uploadedImagePath) { File(uploadedImagePath) }
+
+            Card(shape = RoundedCornerShape(20.dp)) {
+                Column(Modifier.padding(12.dp)) {
+
+                    Text(
+                        "Loaded Image",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+
+                    Spacer(Modifier.height(6.dp))
+
+                    Text(
+                        "${f.name} · ${f.length()} bytes",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
+                    Spacer(Modifier.height(8.dp))
+
+                    val bitmap = remember(uploadedImagePath) {
+                        android.graphics.BitmapFactory.decodeFile(uploadedImagePath)
+                    }
+
+                    if (bitmap == null) {
+                        Text(
+                            "Failed to decode image.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    } else {
+                        androidx.compose.foundation.Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = "Loaded image",
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(200.dp)
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+        }
+
+
+
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Button(
                 onClick = onCapture,
-                enabled = cameraGranted && cameraReady,
-                modifier = Modifier
-                    .weight(1f)
-                    .height(52.dp),
+                enabled = cameraGranted && cameraReady && !isProcessing,
+                modifier = Modifier.weight(1f).height(52.dp),
                 shape = RoundedCornerShape(16.dp)
             ) { Text("Capture") }
 
             OutlinedButton(
                 onClick = onUpload,
-                modifier = Modifier
-                    .weight(1f)
-                    .height(52.dp),
+                enabled = !isProcessing,
+                modifier = Modifier.weight(1f).height(52.dp),
                 shape = RoundedCornerShape(16.dp)
             ) { Text("Upload Photo") }
         }
 
         Spacer(Modifier.height(10.dp))
 
-        Button(
-            onClick = onTestText,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(52.dp),
+        OutlinedButton(
+            onClick = onQuickTest,
+            enabled = !isProcessing,
+            modifier = Modifier.fillMaxWidth().height(52.dp),
             shape = RoundedCornerShape(16.dp)
-        ) { Text("Test: Who are you?") }
+        ) { Text("Quick Test (Default Photo)") }
 
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(12.dp))
 
         Card(shape = RoundedCornerShape(20.dp)) {
             Column(Modifier.padding(14.dp)) {
-                Text(headline, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(6.dp))
-                Text(detail, style = MaterialTheme.typography.bodyMedium)
+
+                OutlinedTextField(
+                    value = questionText,
+                    onValueChange = onQuestionTextChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text("What is this? Is it safe?") },
+                    singleLine = true,
+                    enabled = !isProcessing
+                )
+
+                Spacer(Modifier.height(8.dp))
+
+                Button(
+                    onClick = onAskSubmit,
+                    enabled = questionText.isNotBlank() && !isProcessing &&
+                            (hasUploadedImage || (cameraGranted && cameraReady)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Ask")
+                }
+
+                if (isProcessing) {
+                    Spacer(Modifier.height(8.dp))
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
             }
         }
 
-        if (rawOutput.isNotBlank()) {
+        if (streamingAnswer.isNotBlank()) {
             Spacer(Modifier.height(12.dp))
             Card(shape = RoundedCornerShape(20.dp)) {
                 Column(Modifier.padding(14.dp)) {
-                    Text("Raw output", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("Answer", fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(6.dp))
-                    Text(rawOutput, style = MaterialTheme.typography.bodySmall)
+                    Text(streamingAnswer)
                 }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        Card(shape = RoundedCornerShape(20.dp)) {
+            Column(Modifier.padding(14.dp)) {
+                Text(headline, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(6.dp))
+                Text(detail)
             }
         }
     }
 }
+
 
 @Composable
 private fun OverlayHint(
@@ -629,9 +788,7 @@ private fun OverlayHint(
     onPrimary: () -> Unit
 ) {
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
+        modifier = Modifier.fillMaxSize().padding(16.dp),
         contentAlignment = Alignment.Center
     ) {
         Card(shape = RoundedCornerShape(18.dp)) {
@@ -643,16 +800,54 @@ private fun OverlayHint(
                 Spacer(Modifier.height(6.dp))
                 Text(subtitle, style = MaterialTheme.typography.bodySmall, textAlign = TextAlign.Center)
                 Spacer(Modifier.height(10.dp))
-                Button(
-                    onClick = onPrimary,
-                    shape = RoundedCornerShape(14.dp)
-                ) { Text(primary) }
+                Button(onClick = onPrimary, shape = RoundedCornerShape(14.dp)) { Text(primary) }
             }
         }
     }
 }
 
 // ---------------- helpers ----------------
+
+private fun defaultQuestion(audience: Audience): String {
+    return when (audience) {
+        Audience.ELDERLY ->
+            "What is this object? What is it used for? Are there any safety concerns?"
+        Audience.CHILD ->
+            "What is this? What does it do? Is it safe to use?"
+    }
+}
+
+private fun buildPrompt(audience: Audience, userQuestion: String): String {
+
+    val system = when (audience) {
+
+        Audience.ELDERLY -> """
+You are LifeLens, an offline assistant designed for elderly users.
+
+Rules:
+- Use very simple English.
+- Use short sentences.
+- Explain what the object is.
+- Explain what it is used for.
+- Give 1–3 safety tips if needed.
+- If unsure, say you are not certain and give safe advice.
+""".trimIndent()
+
+        Audience.CHILD -> """
+You are LifeLens, an assistant for children (age 6–10).
+
+Rules:
+- Use friendly and simple language.
+- Explain what the object is.
+- Explain what it does.
+- Add one fun fact if possible.
+- Always mention safety if relevant.
+""".trimIndent()
+    }
+
+    return system + "\n\nUser question: " + userQuestion.trim()
+}
+
 
 private suspend fun copyUriToFile(resolver: ContentResolver, uri: Uri, outFile: File) {
     withContext(Dispatchers.IO) {
@@ -669,42 +864,19 @@ private suspend fun copyUriToFile(resolver: ContentResolver, uri: Uri, outFile: 
     }
 }
 
-// ---------- JSON parsing utilities ----------
-private val json = Json { ignoreUnknownKeys = true }
-
-private fun extractFirstJsonObject(text: String): String? {
-    val start = text.indexOf('{')
-    if (start < 0) return null
-    var depth = 0
-    for (i in start until text.length) {
-        when (text[i]) {
-            '{' -> depth++
-            '}' -> {
-                depth--
-                if (depth == 0) return text.substring(start, i + 1)
+private suspend fun copyAssetToCache(context: android.content.Context, assetName: String): String =
+    withContext(Dispatchers.IO) {
+        val outFile = File(context.cacheDir, "asset_${assetName}_${System.currentTimeMillis()}.jpg")
+        context.assets.open(assetName).use { input ->
+            FileOutputStream(outFile).use { output ->
+                val buf = ByteArray(1024 * 256)
+                while (true) {
+                    val read = input.read(buf)
+                    if (read <= 0) break
+                    output.write(buf, 0, read)
+                }
             }
         }
+        require(outFile.exists() && outFile.length() > 0L) { "Asset copy failed: $assetName" }
+        outFile.absolutePath
     }
-    return null
-}
-
-private fun parseVisionDetectResult(raw: String): VisionDetectResult {
-    val jsonObj = extractFirstJsonObject(raw)
-        ?: return VisionDetectResult(
-            label = "unknown",
-            category = "other",
-            confidence = 0.0,
-            hazards = listOf("Model output not JSON")
-        )
-
-    return try {
-        json.decodeFromString(VisionDetectResult.serializer(), jsonObj)
-    } catch (e: SerializationException) {
-        VisionDetectResult(
-            label = "unknown",
-            category = "other",
-            confidence = 0.0,
-            hazards = listOf("JSON parse failed: ${e.message}")
-        )
-    }
-}

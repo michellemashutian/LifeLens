@@ -2,47 +2,43 @@ package com.example.lifelens.nexa
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.withContext
+import java.io.File
+
 import com.nexa.sdk.NexaSdk
 import com.nexa.sdk.VlmWrapper
 import com.nexa.sdk.bean.GenerationConfig
 import com.nexa.sdk.bean.LlmStreamResult
 import com.nexa.sdk.bean.ModelConfig
 import com.nexa.sdk.bean.VlmCreateInput
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.withContext
-import java.io.File
 
 class NexaVlmClient(
     private val context: Context,
-    // 必须是 files-1-1.nexa 的绝对路径
-    private val modelPath: String
+    private val modelPath: String,     // 必须是 files-1-1.nexa 的绝对路径
+    private val pluginId: String       // "cpu" or "npu"
 ) {
-
     private var vlmWrapper: VlmWrapper? = null
+    val activePluginId: String get() = pluginId
 
     suspend fun init() = withContext(Dispatchers.IO) {
-
-        // 1️⃣ 初始化 SDK（官网 demo）
         NexaSdk.getInstance().init(context)
 
-        // 2️⃣ 校验入口文件存在
         val entryFile = File(modelPath)
-        require(entryFile.exists() && entryFile.isFile) {
+        require(entryFile.exists() && entryFile.isFile && entryFile.length() > 0L) {
             "Model entry file not found: ${entryFile.absolutePath}"
         }
 
-        Log.d(TAG, "Loading model from: ${entryFile.absolutePath}")
+        Log.d(TAG, "Loading model: ${entryFile.absolutePath}, plugin=$pluginId")
 
-        // 3️⃣ 完全按照官网 demo 创建
         val input = VlmCreateInput(
             model_name = "omni-neural",
             model_path = entryFile.absolutePath,
-            config = ModelConfig(
-                max_tokens = 2048,
-                enable_thinking = false
-            ),
-            plugin_id = "npu"
+            config = ModelConfig(max_tokens = 1024, enable_thinking = false),
+            plugin_id = pluginId
         )
 
         vlmWrapper = VlmWrapper.builder()
@@ -50,31 +46,27 @@ class NexaVlmClient(
             .build()
             .getOrThrow()
 
-        Log.d(TAG, "Model loaded successfully (NPU)")
+        Log.d(TAG, "Model loaded OK ($pluginId)")
     }
 
-    suspend fun generate(prompt: String): String =
-        withContext(Dispatchers.IO) {
+    fun generateWithImageStream(prompt: String, imagePath: String): Flow<String> = flow {
+        val wrapper = vlmWrapper ?: error("Model not initialized. Call init() first.")
+        val img = File(imagePath)
+        require(img.exists() && img.isFile && img.length() > 0L) { "Image not found: $imagePath" }
 
-            val wrapper = vlmWrapper
-                ?: error("Model not initialized. Call init() first.")
+        val cfg = GenerationConfig(
+            imagePaths = arrayOf(img.absolutePath),
+            imageCount = 1
+        )
 
-            val sb = StringBuilder()
-
-            wrapper.generateStreamFlow(
-                prompt,
-                GenerationConfig()
-            ).collect { result ->
-                when (result) {
-                    is LlmStreamResult.Token -> sb.append(result.text)
-                    is LlmStreamResult.Completed -> { }
-                    is LlmStreamResult.Error ->
-                        throw RuntimeException("Generation error: $result")
-                }
+        wrapper.generateStreamFlow(prompt, cfg).collect { r ->
+            when (r) {
+                is LlmStreamResult.Token -> emit(r.text)
+                is LlmStreamResult.Completed -> Unit
+                is LlmStreamResult.Error -> throw RuntimeException("Generation error: $r")
             }
-
-            sb.toString()
         }
+    }.flowOn(Dispatchers.IO)
 
     suspend fun destroy() = withContext(Dispatchers.IO) {
         try { vlmWrapper?.stopStream() } catch (_: Throwable) {}
@@ -82,7 +74,5 @@ class NexaVlmClient(
         vlmWrapper = null
     }
 
-    companion object {
-        private const val TAG = "NexaVlmClient"
-    }
+    companion object { private const val TAG = "NexaVlmClient" }
 }
