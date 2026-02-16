@@ -23,6 +23,7 @@ class NexaVlmClient(
     private val pluginId: String,              // "npu" or "cpu_gpu"
     private val modelFilePath: String,         // .../files-*.nexa
     private val modelDirPath: String,          // .../OmniNeural-4B-mobile
+    private val mmprojPath: String? = null,
     private val npuLibFolderPath: String? = null // applicationInfo.nativeLibraryDir
 ) {
     companion object { private const val TAG = "NexaVlmClient" }
@@ -38,7 +39,6 @@ class NexaVlmClient(
         enableThinking: Boolean = false
     ): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
-            // ✅ 注意：不同版本 init() 可能返回 Int，但我们不关心返回值
             NexaSdk.getInstance().init(context)
 
             val modelFile = File(modelFilePath)
@@ -51,10 +51,13 @@ class NexaVlmClient(
                 "modelDir not found/not dir: $modelDirPath"
             }
 
-            Log.i(TAG, "init(): modelName=$modelName pluginId=$pluginId")
-            Log.i(TAG, "init(): modelFile=$modelFilePath (${modelFile.length()} bytes)")
-            Log.i(TAG, "init(): modelDir=$modelDirPath")
-            Log.i(TAG, "init(): npuLibFolderPath=$npuLibFolderPath")
+            Log.i(TAG, "init(): modelName=$modelName pluginId=$pluginId mmprojPath=$mmprojPath")
+
+            mmprojPath?.let { p ->
+                val f = File(p)
+                require(f.exists() && f.isFile && f.length() > 0L) { "mmproj not found/empty: $p" }
+            }
+
 
             val config = if (pluginId == "npu") {
                 ModelConfig(
@@ -63,12 +66,11 @@ class NexaVlmClient(
                     enable_thinking = enableThinking,
                     npu_lib_folder_path = npuLibFolderPath,
                     npu_model_folder_path = modelDirPath
-                    // ✅ device_id 这个字段你当前 SDK 没有，删掉
                 )
             } else {
                 ModelConfig(
-                    nCtx = 1024,
-                    nThreads = 4,
+                    nCtx = nCtx,
+                    nThreads = nThreads,
                     nBatch = 1,
                     nUBatch = 1,
                     enable_thinking = enableThinking
@@ -78,7 +80,7 @@ class NexaVlmClient(
             val input = VlmCreateInput(
                 model_name = modelName,
                 model_path = modelFilePath,
-                mmproj_path = null,      // ✅ 不需要 mmproj 就保持 null
+                mmproj_path = mmprojPath,
                 config = config,
                 plugin_id = pluginId
             )
@@ -89,8 +91,6 @@ class NexaVlmClient(
                 .getOrElse { throw it }
 
             Log.i(TAG, "init(): Model loaded OK")
-
-            // ✅ 强制让 runCatching 返回 Unit，避免 Result<Int> / Result<Something>
             Unit
         }
     }
@@ -106,23 +106,42 @@ class NexaVlmClient(
         val img = File(imagePath)
         require(img.exists() && img.isFile && img.length() > 0L) { "Image not found/empty: $imagePath" }
 
-        Log.i(TAG, "generateWithImageStream(): plugin=$pluginId img=${img.absolutePath} (${img.length()} bytes)")
-        Log.i(TAG, "generateWithImageStream(): prompt=${prompt.take(300)}")
-
+        // VlmContent(type, text)
+        // type: "image" or "text"
+        // text: path for image, or the actual text for prompt
         val messages = arrayOf(
             VlmChatMessage(
                 role = "user",
                 contents = listOf(
-                    VlmContent("image", img.absolutePath),
-                    VlmContent("text", prompt)
+                    VlmContent(type = "image", text = img.absolutePath),
+                    VlmContent(type = "text", text = prompt)
                 )
             )
         )
 
+        // 1) 让 SDK 生成“真正的 prompt” (Chat Template)
+        val templateResult = w.applyChatTemplate(
+            messages = messages,
+            tools = null,
+            enableThinking = false
+        ).getOrElse { throw it }
+
+        val chatPrompt = templateResult.formattedText
+
+        // 2) 把图片路径注入 config (Inject Media)
         val baseConfig = GenerationConfig()
         val configWithMedia = w.injectMediaPathsToConfig(messages, baseConfig)
 
-        w.generateStreamFlow(prompt, configWithMedia).collect { r ->
+        Log.i(TAG, "finalPrompt(head)=${chatPrompt.take(300)}")
+        Log.i(TAG, "imageCount=${configWithMedia.imageCount} imagePaths=${configWithMedia.imagePaths}")
+        Log.i(
+            TAG,
+            "imageCount=${configWithMedia.imageCount} imagePaths=${configWithMedia.imagePaths?.joinToString()}"
+        )
+
+
+        // 3) 真正生成 (Stream Flow)
+        w.generateStreamFlow(chatPrompt, configWithMedia).collect { r ->
             when (r) {
                 is LlmStreamResult.Token -> emit(r.text)
                 is LlmStreamResult.Completed -> Log.i(TAG, "completed")
