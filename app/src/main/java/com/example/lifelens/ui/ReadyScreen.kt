@@ -30,8 +30,6 @@ fun ReadyScreen(
     uploadedImagePath: String?,
     onRequestCamera: () -> Unit,
     onBindCamera: () -> Unit,
-    audience: Audience,
-    onAudienceChange: (Audience) -> Unit,
     onUpload: () -> Unit,
     onCapture: () -> Unit,
     headline: String,
@@ -88,21 +86,21 @@ fun ReadyScreen(
             .padding(horizontal = 16.dp, vertical = 12.dp)
     ) {
         // Top bar
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("LifeLens", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.weight(1f))
-            FilterChip(
-                selected = audience == Audience.ELDERLY,
-                onClick = { onAudienceChange(Audience.ELDERLY) },
-                label = { Text("Elderly") }
-            )
-            Spacer(Modifier.width(8.dp))
-            FilterChip(
-                selected = audience == Audience.CHILD,
-                onClick = { onAudienceChange(Audience.CHILD) },
-                label = { Text("Child") }
-            )
-        }
+//        Row(verticalAlignment = Alignment.CenterVertically) {
+//            Text("LifeLens", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+//            Spacer(Modifier.weight(1f))
+//            FilterChip(
+//                selected = audience == Audience.ELDERLY,
+//                onClick = { onAudienceChange(Audience.ELDERLY) },
+//                label = { Text("Elderly") }
+//            )
+//            Spacer(Modifier.width(8.dp))
+//            FilterChip(
+//                selected = audience == Audience.CHILD,
+//                onClick = { onAudienceChange(Audience.CHILD) },
+//                label = { Text("Child") }
+//            )
+//        }
 
         Spacer(Modifier.height(10.dp))
 

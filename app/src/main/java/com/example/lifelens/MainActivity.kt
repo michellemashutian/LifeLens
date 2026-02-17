@@ -37,6 +37,9 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 
 enum class Phase { INTRO, SETUP, READY }
 
@@ -104,6 +107,8 @@ class MainActivity : ComponentActivity() {
                 var questionText by remember { mutableStateOf("") }
                 var isProcessing by remember { mutableStateOf(false) }
                 var streamingAnswer by remember { mutableStateOf("") }
+                var inferJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+
 
                 // audience
                 var audience by remember { mutableStateOf(Audience.ELDERLY) }
@@ -127,7 +132,7 @@ class MainActivity : ComponentActivity() {
                             copyUriToFile(context.contentResolver, uri, rawFile)
                             require(rawFile.exists() && rawFile.length() > 0L) { "Uploaded file is empty" }
 
-                            val prepared = prepareImageForVlm(context, rawFile.absolutePath, maxSize = 640, squareCrop = false)
+                            val prepared = prepareImageForVlm(context, rawFile.absolutePath, maxSize = 768, squareCrop = false)
                             uploadedImagePath = prepared
 
                             if (questionText.isBlank()) questionText = defaultQuestion(audience)
@@ -176,7 +181,8 @@ class MainActivity : ComponentActivity() {
                             }
 
                             // emulator 强制 cpu_gpu
-                            val effectivePlugin = if (isEmulator) "cpu_gpu" else requested
+                            // val effectivePlugin = if (isEmulator) "cpu_gpu" else requested
+                            val effectivePlugin = "npu"
 
                             val manifest = modelManager.getNexaManifest(spec)
                             val modelName = manifest?.ModelName?.takeIf { it.isNotBlank() } ?: spec.id
@@ -217,11 +223,23 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                suspend fun stopPreviousInference() {
+                    // 不要 cancel inferJob（否则会自杀）
+                    runCatching { activeClient?.stopStream() } // 停 native 推理
+                    isProcessing = false
+                }
+
+
                 fun handleAskWithImage() {
                     val q = questionText.trim()
                     if (q.isBlank() || isProcessing) return
 
-                    scope.launch {
+                    val prev = inferJob
+                    inferJob = scope.launch {
+                        prev?.cancelAndJoin()
+                        runCatching { activeClient?.stopStream() }
+
+                        // 再开始这一轮
                         isProcessing = true
                         streamingAnswer = ""
 
@@ -239,7 +257,12 @@ class MainActivity : ComponentActivity() {
                                 val captured = takePhoto(context, imageCapture, raw)
                                 require(captured.exists() && captured.length() > 0L) { "Captured image is empty" }
 
-                                val prepared = prepareImageForVlm(context, captured.absolutePath, maxSize = 640, squareCrop = false)
+                                val prepared = prepareImageForVlm(
+                                    context,
+                                    captured.absolutePath,
+                                    maxSize = 768,
+                                    squareCrop = false
+                                )
                                 uploadedImagePath = prepared
                                 prepared
                             }
@@ -256,36 +279,50 @@ class MainActivity : ComponentActivity() {
 
                             headline = "Ready"
                             detail = q
+
                         } catch (t: Throwable) {
+                            if (t is kotlinx.coroutines.CancellationException) {
+                                // 正常取消，不算错误
+                                Log.d("LifeLens", "Inference cancelled")
+                                return@launch
+                            }
+
                             Log.e("LifeLens", "Ask failed", t)
                             headline = "Failed"
                             detail = t.message ?: "Unknown error"
-                            if (streamingAnswer.isBlank()) streamingAnswer = "Error: ${t.message ?: "Unknown"}"
-                        } finally {
+                            if (streamingAnswer.isBlank()) {
+                                streamingAnswer = "Error: ${t.message ?: "Unknown"}"
+                            }
+                        }
+                        finally {
                             isProcessing = false
                         }
                     }
                 }
 
+
                 fun quickTestDefaultPhoto() {
                     if (isProcessing) return
+                    val prev = inferJob
+                    inferJob = scope.launch {
+                        prev?.cancelAndJoin()
+                        runCatching { activeClient?.stopStream() }
 
-                    scope.launch {
                         isProcessing = true
-                        runCatching {
+                        streamingAnswer = ""
+
+                        try {
                             val client = activeClient ?: error("Model not initialized. Tap Get Started first.")
 
                             headline = "Loading default image..."
                             detail = "Preparing test..."
 
                             val raw = copyAssetToCache(context, "default_test.jpg")
-                            val prepared = prepareImageForVlm(context, raw, maxSize = 640, squareCrop = false)
+                            val prepared = prepareImageForVlm(context, raw, maxSize = 768, squareCrop = false)
                             uploadedImagePath = prepared
 
-                            questionText = defaultQuestion(audience)
-                            streamingAnswer = ""
-
-                            val prompt = buildPrompt(audience, questionText)
+                            if (questionText.isBlank()) questionText = defaultQuestion(audience)
+                            val prompt = buildPrompt(Audience.ELDERLY, questionText)
 
                             headline = "Thinking..."
                             detail = questionText
@@ -297,13 +334,26 @@ class MainActivity : ComponentActivity() {
                             headline = "Ready"
                             detail = questionText
 
-                        }.onFailure {
-                            headline = "Quick test failed"
-                            detail = it.message ?: "Unknown error"
+                        } catch (t: Throwable) {
+                            if (t is kotlinx.coroutines.CancellationException) {
+                                // 正常取消，不算错误
+                                Log.d("LifeLens", "Inference cancelled")
+                                return@launch
+                            }
+
+                            Log.e("LifeLens", "Ask failed", t)
+                            headline = "Failed"
+                            detail = t.message ?: "Unknown error"
+                            if (streamingAnswer.isBlank()) {
+                                streamingAnswer = "Error: ${t.message ?: "Unknown"}"
+                            }
                         }
-                        isProcessing = false
+                        finally {
+                            isProcessing = false
+                        }
                     }
                 }
+
 
                 fun startSetup() {
                     if (setupRunning) return
@@ -336,10 +386,10 @@ class MainActivity : ComponentActivity() {
                             }
 
                             headline = "Initializing..."
-                            detail = "Trying CPU/GPU…"
+                            detail = "Trying NPU…"
                             progress = null
 
-                            val tryOrder = listOf("cpu_gpu", "npu")
+                            val tryOrder = listOf("npu")
                             var lastError: Throwable? = null
                             var okClient: NexaVlmClient? = null
 
@@ -395,7 +445,7 @@ class MainActivity : ComponentActivity() {
                     when (phase) {
                         Phase.INTRO -> IntroScreen(
                             title = "LifeLens",
-                            subtitle = "Understand what you see.\nMade for Elderly & Kids.",
+                            subtitle = "Understand what you see.\nA simple assistant for seniors.",
                             primaryText = if (setupRunning) "Starting…" else "Get Started",
                             onPrimary = { startSetup() }
                         )
@@ -425,11 +475,6 @@ class MainActivity : ComponentActivity() {
                             uploadedImagePath = uploadedImagePath,
                             onRequestCamera = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
                             onBindCamera = { bindCamera() },
-                            audience = audience,
-                            onAudienceChange = {
-                                audience = it
-                                if (questionText.isBlank()) questionText = defaultQuestion(audience)
-                            },
                             onUpload = { uploadLauncher.launch("image/*") },
                             onCapture = {
                                 scope.launch {
@@ -439,7 +484,7 @@ class MainActivity : ComponentActivity() {
                                         val captured = takePhoto(context, imageCapture, raw)
                                         require(captured.exists() && captured.length() > 0L) { "Captured image is empty" }
 
-                                        val prepared = prepareImageForVlm(context, captured.absolutePath, maxSize = 640, squareCrop = false)
+                                        val prepared = prepareImageForVlm(context, captured.absolutePath, maxSize = 768, squareCrop = false)
                                         uploadedImagePath = prepared
 
                                         if (questionText.isBlank()) questionText = defaultQuestion(audience)
