@@ -23,6 +23,9 @@ import com.example.lifelens.camera.takePhoto
 import com.example.lifelens.nexa.ModelManager
 import com.example.lifelens.nexa.NexaVlmClient
 import com.example.lifelens.tool.Audience
+import com.example.lifelens.tool.SpeechSpeed
+import com.example.lifelens.tool.TtsManager
+import com.example.lifelens.ui.ChatMsg
 import com.example.lifelens.ui.IntroScreen
 import com.example.lifelens.ui.ReadyScreen
 import com.example.lifelens.ui.SetupScreen
@@ -109,12 +112,24 @@ class MainActivity : ComponentActivity() {
                 var streamingAnswer by remember { mutableStateOf("") }
                 var inferJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
+                // Persistent chat history (survives across multiple questions)
+                val chatHistory = remember { mutableStateListOf<ChatMsg>() }
+
+                // TTS
+                var isSpeaking by remember { mutableStateOf(false) }
+                var speechSpeed by remember { mutableStateOf(SpeechSpeed.SLOW) }
+                val ttsManager = remember {
+                    TtsManager(context) { speaking -> isSpeaking = speaking }
+                }
 
                 // audience
                 var audience by remember { mutableStateOf(Audience.ELDERLY) }
 
                 DisposableEffect(Unit) {
-                    onDispose { scope.launch { runCatching { activeClient?.destroy() } } }
+                    onDispose {
+                        scope.launch { runCatching { activeClient?.destroy() } }
+                        ttsManager.shutdown()
+                    }
                 }
 
                 // Upload photo -> copy to cache -> prepare for VLM -> store absolute path
@@ -132,7 +147,7 @@ class MainActivity : ComponentActivity() {
                             copyUriToFile(context.contentResolver, uri, rawFile)
                             require(rawFile.exists() && rawFile.length() > 0L) { "Uploaded file is empty" }
 
-                            val prepared = prepareImageForVlm(context, rawFile.absolutePath, maxSize = 768, squareCrop = false)
+                            val prepared = prepareImageForVlm(context, rawFile.absolutePath, maxSize = 448, squareCrop = true)
                             uploadedImagePath = prepared
 
                             if (questionText.isBlank()) questionText = defaultQuestion(audience)
@@ -239,9 +254,11 @@ class MainActivity : ComponentActivity() {
                         prev?.cancelAndJoin()
                         runCatching { activeClient?.stopStream() }
 
-                        // 再开始这一轮
                         isProcessing = true
                         streamingAnswer = ""
+
+                        // Add user question to persistent history
+                        chatHistory.add(ChatMsg("user", q))
 
                         try {
                             val client = activeClient ?: error("Model not initialized. Tap Get Started first.")
@@ -251,7 +268,6 @@ class MainActivity : ComponentActivity() {
                                     error("No image yet. Please Upload Photo, or use Quick Test.")
                                 }
                                 headline = "Capturing..."
-                                detail = q
 
                                 val raw = File(context.cacheDir, "ask_capture_raw_${System.currentTimeMillis()}.jpg")
                                 val captured = takePhoto(context, imageCapture, raw)
@@ -260,8 +276,8 @@ class MainActivity : ComponentActivity() {
                                 val prepared = prepareImageForVlm(
                                     context,
                                     captured.absolutePath,
-                                    maxSize = 768,
-                                    squareCrop = false
+                                    maxSize = 448,
+                                    squareCrop = true
                                 )
                                 uploadedImagePath = prepared
                                 prepared
@@ -270,32 +286,30 @@ class MainActivity : ComponentActivity() {
                             val prompt = buildPrompt(audience, q)
 
                             headline = "Thinking..."
-                            detail = q
                             Log.d("LifeLens", "Ask with image=$imagePath plugin=$pluginId")
 
                             client.generateWithImageStream(imagePath, prompt).collect { token ->
                                 streamingAnswer += token
                             }
 
+                            // Add completed answer to persistent history
+                            chatHistory.add(ChatMsg("assistant", streamingAnswer))
                             headline = "Ready"
-                            detail = q
 
                         } catch (t: Throwable) {
                             if (t is kotlinx.coroutines.CancellationException) {
-                                // 正常取消，不算错误
                                 Log.d("LifeLens", "Inference cancelled")
                                 return@launch
                             }
 
                             Log.e("LifeLens", "Ask failed", t)
                             headline = "Failed"
-                            detail = t.message ?: "Unknown error"
-                            if (streamingAnswer.isBlank()) {
-                                streamingAnswer = "Error: ${t.message ?: "Unknown"}"
-                            }
+                            val errMsg = "Error: ${t.message ?: "Unknown"}"
+                            chatHistory.add(ChatMsg("system", errMsg))
                         }
                         finally {
                             isProcessing = false
+                            streamingAnswer = ""
                         }
                     }
                 }
@@ -315,41 +329,41 @@ class MainActivity : ComponentActivity() {
                             val client = activeClient ?: error("Model not initialized. Tap Get Started first.")
 
                             headline = "Loading default image..."
-                            detail = "Preparing test..."
 
-                            val raw = copyAssetToCache(context, "default_test.jpg")
-                            val prepared = prepareImageForVlm(context, raw, maxSize = 768, squareCrop = false)
+                            val raw = copyAssetToCache(context, "advil_test.jpg")
+                            val prepared = prepareImageForVlm(context, raw, maxSize = 448, squareCrop = true)
                             uploadedImagePath = prepared
 
                             if (questionText.isBlank()) questionText = defaultQuestion(audience)
                             val prompt = buildPrompt(Audience.ELDERLY, questionText)
 
+                            // Add user question to persistent history
+                            chatHistory.add(ChatMsg("user", questionText))
+
                             headline = "Thinking..."
-                            detail = questionText
 
                             client.generateWithImageStream(prepared, prompt).collect { token ->
                                 streamingAnswer += token
                             }
 
+                            // Add completed answer to persistent history
+                            chatHistory.add(ChatMsg("assistant", streamingAnswer))
                             headline = "Ready"
-                            detail = questionText
 
                         } catch (t: Throwable) {
                             if (t is kotlinx.coroutines.CancellationException) {
-                                // 正常取消，不算错误
                                 Log.d("LifeLens", "Inference cancelled")
                                 return@launch
                             }
 
                             Log.e("LifeLens", "Ask failed", t)
                             headline = "Failed"
-                            detail = t.message ?: "Unknown error"
-                            if (streamingAnswer.isBlank()) {
-                                streamingAnswer = "Error: ${t.message ?: "Unknown"}"
-                            }
+                            val errMsg = "Error: ${t.message ?: "Unknown"}"
+                            chatHistory.add(ChatMsg("system", errMsg))
                         }
                         finally {
                             isProcessing = false
+                            streamingAnswer = ""
                         }
                     }
                 }
@@ -484,7 +498,7 @@ class MainActivity : ComponentActivity() {
                                         val captured = takePhoto(context, imageCapture, raw)
                                         require(captured.exists() && captured.length() > 0L) { "Captured image is empty" }
 
-                                        val prepared = prepareImageForVlm(context, captured.absolutePath, maxSize = 768, squareCrop = false)
+                                        val prepared = prepareImageForVlm(context, captured.absolutePath, maxSize = 448, squareCrop = true)
                                         uploadedImagePath = prepared
 
                                         if (questionText.isBlank()) questionText = defaultQuestion(audience)
@@ -496,14 +510,21 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             },
-                            headline = headline,
-                            detail = detail,
+                            chatHistory = chatHistory,
                             questionText = questionText,
                             onQuestionTextChange = { questionText = it },
                             isProcessing = isProcessing,
                             streamingAnswer = streamingAnswer,
                             onAskSubmit = { handleAskWithImage() },
-                            onQuickTest = { quickTestDefaultPhoto() }
+                            onQuickTest = { quickTestDefaultPhoto() },
+                            isSpeaking = isSpeaking,
+                            onSpeakClick = { text -> ttsManager.speak(text) },
+                            onStopSpeaking = { ttsManager.stop() },
+                            speechSpeed = speechSpeed,
+                            onSpeedChange = { speed ->
+                                speechSpeed = speed
+                                ttsManager.setSpeechRate(speed.rate)
+                            }
                         )
                     }
                 }

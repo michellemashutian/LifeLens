@@ -30,6 +30,11 @@ class NexaVlmClient(
 
     private var wrapper: VlmWrapper? = null
 
+    /** Accumulated multi-turn chat history, matching the Nexa demo's vlmChatList. */
+    private val chatHistory = mutableListOf<VlmChatMessage>()
+
+    fun clearHistory() { chatHistory.clear() }
+
     /**
      * Load model.
      */
@@ -58,7 +63,6 @@ class NexaVlmClient(
                 require(f.exists() && f.isFile && f.length() > 0L) { "mmproj not found/empty: $p" }
             }
 
-
             val config = if (pluginId == "npu") {
                 ModelConfig(
                     nCtx = nCtx,
@@ -82,7 +86,8 @@ class NexaVlmClient(
                 model_path = modelFilePath,
                 mmproj_path = mmprojPath,
                 config = config,
-                plugin_id = pluginId
+                plugin_id = pluginId,
+                device_id = "HTP0"
             )
 
             wrapper = VlmWrapper.builder()
@@ -99,6 +104,9 @@ class NexaVlmClient(
 
     /**
      * Stream tokens for (image + prompt).
+     * Accumulates multi-turn chat history like the Nexa demo app.
+     * Passes raw input string (not formattedText) to generateStreamFlow,
+     * matching the Nexa demo's behavior for NPU models.
      */
     fun generateWithImageStream(imagePath: String, prompt: String): Flow<String> = flow {
         val w = requireNotNull(wrapper) { "VLM not initialized. Call init() first." }
@@ -106,48 +114,56 @@ class NexaVlmClient(
         val img = File(imagePath)
         require(img.exists() && img.isFile && img.length() > 0L) { "Image not found/empty: $imagePath" }
 
-        // VlmContent(type, text)
-        // type: "image" or "text"
-        // text: path for image, or the actual text for prompt
-        val messages = arrayOf(
-            VlmChatMessage(
-                role = "user",
-                contents = listOf(
-                    VlmContent(type = "image", text = img.absolutePath),
-                    VlmContent(type = "text", text = prompt)
-                )
-            )
+        // Clear previous conversation for fresh single-turn context.
+        // NOTE: Do NOT call w.reset() here — it corrupts state before applyChatTemplate
+        // and causes error 1037979640. reset() should only be called separately (e.g. clearHistory button).
+        chatHistory.clear()
+
+        // Build content list: image first, then text (matching Nexa demo)
+        val contents = mutableListOf(
+            VlmContent(type = "image", text = img.absolutePath),
+            VlmContent(type = "text", text = prompt)
         )
 
-        // 1) 让 SDK 生成“真正的 prompt” (Chat Template)
-        val templateResult = w.applyChatTemplate(
-            messages = messages,
+        // Add to accumulated chat history (matching Nexa demo's multi-turn pattern)
+        val userMsg = VlmChatMessage(role = "user", contents = contents)
+        chatHistory.add(userMsg)
+
+        val allMessages = chatHistory.toTypedArray()
+
+        // 1) Apply chat template
+        w.applyChatTemplate(
+            messages = allMessages,
             tools = null,
             enableThinking = false
         ).getOrElse { throw it }
 
-        val chatPrompt = templateResult.formattedText
+        // 2) Inject image paths into config (use GenerationConfigSample for proper maxTokens=2048)
+        val baseConfig = GenerationConfigSample().toGenerationConfig()
+        val configWithMedia = w.injectMediaPathsToConfig(allMessages, baseConfig)
 
-        // 2) 把图片路径注入 config (Inject Media)
-        val baseConfig = GenerationConfig()
-        val configWithMedia = w.injectMediaPathsToConfig(messages, baseConfig)
+        Log.i(TAG, "imageCount=${configWithMedia.imageCount} imagePaths=${configWithMedia.imagePaths?.joinToString()}")
 
-        Log.i(TAG, "finalPrompt(head)=${chatPrompt.take(300)}")
-        Log.i(TAG, "imageCount=${configWithMedia.imageCount} imagePaths=${configWithMedia.imagePaths}")
-        Log.i(
-            TAG,
-            "imageCount=${configWithMedia.imageCount} imagePaths=${configWithMedia.imagePaths?.joinToString()}"
-        )
-
-
-        // 3) 真正生成 (Stream Flow)
-        w.generateStreamFlow(chatPrompt, configWithMedia).collect { r ->
+        // 3) Stream generation -- pass raw prompt (not formattedText), matching Nexa demo
+        val sb = StringBuilder()
+        w.generateStreamFlow(prompt, configWithMedia).collect { r ->
             when (r) {
-                is LlmStreamResult.Token -> emit(r.text)
+                is LlmStreamResult.Token -> {
+                    sb.append(r.text)
+                    emit(r.text)
+                }
                 is LlmStreamResult.Completed -> Log.i(TAG, "completed")
                 is LlmStreamResult.Error -> throw r.throwable
             }
         }
+
+        // Add assistant response to chat history for multi-turn
+        chatHistory.add(
+            VlmChatMessage(
+                role = "assistant",
+                contents = listOf(VlmContent(type = "text", text = sb.toString()))
+            )
+        )
     }
 
     suspend fun reset(): Result<Int> = withContext(Dispatchers.IO) {
