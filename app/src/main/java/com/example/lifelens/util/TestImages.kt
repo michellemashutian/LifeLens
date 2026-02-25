@@ -11,6 +11,7 @@ import java.io.File
 private const val TAG = "TestImages"
 
 private val TEST_ASSETS = listOf(
+    "test_rx_bottle.jpg"        to "LifeLens - Prescription Bottle",
     "test_pills_hand.jpg"       to "LifeLens - Pills Bottle (hand)",
     "test_pills2_hand.jpg"      to "LifeLens - Supplement Bottle (hand)",
     "test_kitchen_knife.jpg"    to "LifeLens - Kitchen Knife",
@@ -19,7 +20,7 @@ private val TEST_ASSETS = listOf(
     "test_expired_bread.jpg"    to "LifeLens - Expired Bread"
 )
 
-private const val PREFS_KEY = "test_images_copied_v1"
+private const val PREFS_KEY = "test_images_copied_v2"
 
 /**
  * Copies bundled test images to the device's Downloads folder on first launch.
