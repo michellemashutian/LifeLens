@@ -12,12 +12,13 @@ class TtsManager(
 
     private var tts: TextToSpeech? = TextToSpeech(context, this)
     private var ready = false
+    private var currentRate: Float = 0.45f  // mirrors SpeechSpeed.SLOW default
 
     override fun onInit(status: Int) {
         ready = (status == TextToSpeech.SUCCESS)
         if (ready) {
             tts?.language = Locale.US
-            tts?.setSpeechRate(0.45f)
+            tts?.setSpeechRate(currentRate)
             tts?.setPitch(0.95f)
 
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
@@ -36,11 +37,15 @@ class TtsManager(
     }
 
     fun setSpeechRate(rate: Float) {
+        currentRate = rate
         tts?.setSpeechRate(rate)
     }
 
     fun speak(text: String) {
         if (!ready) return
+        // Re-apply rate before every speak — some TTS engines silently reset
+        // it after stop() or between utterances.
+        tts?.setSpeechRate(currentRate)
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "lifelens_speak")
     }
 
