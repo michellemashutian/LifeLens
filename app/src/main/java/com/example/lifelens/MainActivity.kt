@@ -32,6 +32,7 @@ import com.example.lifelens.ui.SetupScreen
 import com.example.lifelens.ui.theme.LifeLensTheme
 import com.example.lifelens.util.buildPrompt
 import com.example.lifelens.util.copyAssetToCache
+import com.example.lifelens.util.copyTestImagesToDownloads
 import com.example.lifelens.util.copyUriToFile
 import com.example.lifelens.util.defaultQuestion
 import com.example.lifelens.util.prepareImageForVlm
@@ -50,6 +51,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Copy test images to Downloads on first launch (runs once, background thread)
+        Thread { copyTestImagesToDownloads(this) }.start()
 
         setContent {
             LifeLensTheme {
