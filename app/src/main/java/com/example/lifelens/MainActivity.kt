@@ -403,6 +403,8 @@ class MainActivity : ComponentActivity() {
                         val staleJob = inferJob
                         inferJob = null
                         speechResultReady = false
+                        if (isListening) { speechRecognizer?.stopListening(); isListening = false }
+                        ttsManager.stop()
                         staleJob?.cancelAndJoin()
                         isProcessing = false
                         streamingAnswer = ""
@@ -468,6 +470,8 @@ class MainActivity : ComponentActivity() {
                                     val staleJob = inferJob
                                     inferJob = null
                                     speechResultReady = false
+                                    if (isListening) { speechRecognizer?.stopListening(); isListening = false }
+                                    ttsManager.stop()
                                     staleJob?.cancelAndJoin()
                                     isProcessing = false
                                     streamingAnswer = ""
