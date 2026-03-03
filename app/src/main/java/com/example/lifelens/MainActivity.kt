@@ -1,20 +1,23 @@
 package com.example.lifelens
 
 import android.Manifest
-import android.content.ContentResolver
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
-import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
@@ -25,34 +28,33 @@ import com.example.lifelens.nexa.NexaVlmClient
 import com.example.lifelens.tool.Audience
 import com.example.lifelens.tool.SpeechSpeed
 import com.example.lifelens.tool.TtsManager
-import com.example.lifelens.ui.ChatMsg
+import com.example.lifelens.ui.HistoryScreen
+import com.example.lifelens.ui.HomeScreen
 import com.example.lifelens.ui.IntroScreen
-import com.example.lifelens.ui.ReadyScreen
+import com.example.lifelens.ui.PhotoScreen
 import com.example.lifelens.ui.SetupScreen
 import com.example.lifelens.ui.theme.LifeLensTheme
+import com.example.lifelens.util.HistoryRepository
 import com.example.lifelens.util.buildPrompt
-import com.example.lifelens.util.copyAssetToCache
 import com.example.lifelens.util.copyTestImagesToDownloads
 import com.example.lifelens.util.copyUriToFile
 import com.example.lifelens.util.defaultQuestion
 import com.example.lifelens.util.prepareImageForVlm
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancelAndJoin
+import java.util.Locale
 
-enum class Phase { INTRO, SETUP, READY }
+enum class Phase { INTRO, SETUP, HOME, PHOTO, HISTORY }
 
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Copy test images to Downloads on first launch (runs once, background thread)
         Thread { copyTestImagesToDownloads(this) }.start()
 
         setContent {
@@ -60,18 +62,18 @@ class MainActivity : ComponentActivity() {
                 val context = LocalContext.current
                 val scope = rememberCoroutineScope()
 
+                // ── Navigation ──────────────────────────────────────────────
                 var phase by remember { mutableStateOf(Phase.INTRO) }
+                var previousPhase by remember { mutableStateOf(Phase.HOME) }
 
-                // status
+                // ── Setup ────────────────────────────────────────────────────
                 var headline by remember { mutableStateOf("Welcome to LifeLens") }
                 var detail by remember { mutableStateOf("One-tap setup, then point and understand.") }
                 var progress by remember { mutableStateOf<Int?>(null) }
-
-                // setup error
                 var setupError by remember { mutableStateOf<String?>(null) }
                 var setupRunning by remember { mutableStateOf(false) }
 
-                // permissions
+                // ── Permissions ───────────────────────────────────────────────
                 var cameraGranted by remember {
                     mutableStateOf(
                         ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
@@ -79,10 +81,20 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 val cameraPermissionLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.RequestPermission()
+                    ActivityResultContracts.RequestPermission()
                 ) { granted -> cameraGranted = granted }
 
-                // emulator detect
+                var audioGranted by remember {
+                    mutableStateOf(
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                                PackageManager.PERMISSION_GRANTED
+                    )
+                }
+                val audioPermissionLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestPermission()
+                ) { granted -> audioGranted = granted }
+
+                // ── Device detection ─────────────────────────────────────────
                 val isEmulator = remember {
                     Build.FINGERPRINT.contains("generic", true) ||
                             Build.FINGERPRINT.contains("emulator", true) ||
@@ -92,141 +104,123 @@ class MainActivity : ComponentActivity() {
                             Build.DEVICE.contains("generic", true) ||
                             Build.PRODUCT.contains("sdk", true)
                 }
-
-                // default plugin: emulator -> cpu_gpu, device -> npu
                 var pluginId by remember { mutableStateOf(if (isEmulator) "cpu_gpu" else "npu") }
 
-                // camera
-                val previewView = remember { PreviewView(context) }
+                // ── Camera ───────────────────────────────────────────────────
                 val imageCapture = remember { ImageCapture.Builder().build() }
                 var cameraReady by remember { mutableStateOf(false) }
 
-                // model
+                // ── Model ────────────────────────────────────────────────────
                 val modelManager = remember { ModelManager(context) }
                 val spec = remember { modelManager.defaultSpec() }
                 var modelReady by remember { mutableStateOf(false) }
-
-                // nexa
                 var activeClient by remember { mutableStateOf<NexaVlmClient?>(null) }
 
-                // Ask-with-image states
+                // ── Inference ─────────────────────────────────────────────────
                 var uploadedImagePath by remember { mutableStateOf<String?>(null) }
                 var questionText by remember { mutableStateOf("") }
                 var isProcessing by remember { mutableStateOf(false) }
                 var streamingAnswer by remember { mutableStateOf("") }
-                var inferJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+                var currentAnswer by remember { mutableStateOf("") }
+                var inferJob by remember { mutableStateOf<Job?>(null) }
 
-                // Persistent chat history (survives across multiple questions)
-                val chatHistory = remember { mutableStateListOf<ChatMsg>() }
-
-                // TTS
-                var isSpeaking by remember { mutableStateOf(false) }
-                var speechSpeed by remember { mutableStateOf(SpeechSpeed.SLOW) }
-                val ttsManager = remember {
-                    TtsManager(context) { speaking -> isSpeaking = speaking }
+                // ── History ───────────────────────────────────────────────────
+                val historyRepository = remember { HistoryRepository(context) }
+                val historyEntries = remember {
+                    mutableStateListOf<com.example.lifelens.util.HistoryEntry>()
+                        .also { it.addAll(historyRepository.loadAll()) }
                 }
 
-                // audience
-                var audience by remember { mutableStateOf(Audience.ELDERLY) }
+                // ── TTS ───────────────────────────────────────────────────────
+                var isSpeaking by remember { mutableStateOf(false) }
+                var speechSpeed by remember { mutableStateOf(SpeechSpeed.SLOW) }
+                val ttsManager = remember { TtsManager(context) { speaking -> isSpeaking = speaking } }
 
+                // ── Voice recognition ─────────────────────────────────────────
+                var isListening by remember { mutableStateOf(false) }
+                var speechResultReady by remember { mutableStateOf(false) }
+                val speechRecognizer = remember {
+                    if (SpeechRecognizer.isRecognitionAvailable(context))
+                        SpeechRecognizer.createSpeechRecognizer(context)
+                    else null
+                }
+
+                val audience = Audience.ELDERLY
+
+                // ── Lifecycle cleanup ─────────────────────────────────────────
                 DisposableEffect(Unit) {
+                    speechRecognizer?.setRecognitionListener(object : RecognitionListener {
+                        override fun onReadyForSpeech(params: Bundle?) {}
+                        override fun onBeginningOfSpeech() {}
+                        override fun onRmsChanged(rmsdB: Float) {}
+                        override fun onBufferReceived(buffer: ByteArray?) {}
+                        override fun onEndOfSpeech() {}
+                        override fun onPartialResults(partials: Bundle?) {
+                            val text = partials?.getStringArrayList(
+                                SpeechRecognizer.RESULTS_RECOGNITION
+                            )?.firstOrNull()
+                            if (!text.isNullOrBlank()) questionText = text
+                        }
+                        override fun onResults(results: Bundle?) {
+                            val text = results?.getStringArrayList(
+                                SpeechRecognizer.RESULTS_RECOGNITION
+                            )?.firstOrNull()
+                            if (!text.isNullOrBlank()) questionText = text
+                            isListening = false
+                            speechResultReady = true   // triggers LaunchedEffect auto-submit
+                        }
+                        override fun onError(error: Int) { isListening = false }
+                        override fun onEvent(eventType: Int, params: Bundle?) {}
+                    })
                     onDispose {
                         scope.launch { runCatching { activeClient?.destroy() } }
                         ttsManager.shutdown()
+                        speechRecognizer?.destroy()
                     }
                 }
 
-                // Upload photo -> copy to cache -> prepare for VLM -> store absolute path
-                val uploadLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.GetContent()
-                ) { uri: Uri? ->
-                    if (uri == null) return@rememberLauncherForActivityResult
-                    scope.launch {
-                        runCatching {
-                            headline = "Loading image..."
-                            detail = "Copying uploaded photo."
-                            progress = null
-
-                            val rawFile = File(context.cacheDir, "upload_raw_${System.currentTimeMillis()}.jpg")
-                            copyUriToFile(context.contentResolver, uri, rawFile)
-                            require(rawFile.exists() && rawFile.length() > 0L) { "Uploaded file is empty" }
-
-                            val prepared = prepareImageForVlm(context, rawFile.absolutePath, maxSize = 448, squareCrop = true)
-                            uploadedImagePath = prepared
-
-                            if (questionText.isBlank()) questionText = defaultQuestion(audience)
-
-                            headline = "Image ready"
-                            detail = "Tap Ask, or Quick Test."
-                            Log.d("LifeLens", "Uploaded prepared image: $prepared (${File(prepared).length()} bytes)")
-                        }.onFailure {
-                            headline = "Upload failed"
-                            detail = it.message ?: "Unknown error"
-                        }
-                    }
-                }
+                // ── Functions ─────────────────────────────────────────────────
 
                 fun bindCamera() {
                     if (!cameraGranted) return
                     scope.launch {
                         runCatching {
                             val cameraProvider = ProcessCameraProvider.getInstance(context).get()
-                            val preview = Preview.Builder().build().also {
-                                it.setSurfaceProvider(previewView.surfaceProvider)
-                            }
                             cameraProvider.unbindAll()
                             cameraProvider.bindToLifecycle(
                                 this@MainActivity,
-                                androidx.camera.core.CameraSelector.DEFAULT_BACK_CAMERA,
-                                preview,
+                                CameraSelector.DEFAULT_BACK_CAMERA,
                                 imageCapture
                             )
-                        }.onSuccess {
-                            cameraReady = true
-                        }.onFailure {
-                            cameraReady = false
-                            headline = "Camera not ready"
-                            detail = "If emulator preview is black: Emulator → Settings → Camera → Webcam0."
-                        }
+                        }.onSuccess { cameraReady = true }
+                         .onFailure { cameraReady = false }
                     }
                 }
 
                 suspend fun createAndInitClient(pid: String): Result<NexaVlmClient> =
                     withContext(Dispatchers.IO) {
                         runCatching {
-                            val requested = pid.trim().lowercase()
-                            require(requested == "npu" || requested == "cpu_gpu") {
-                                "Invalid pluginId=$pid. Use \"npu\" or \"cpu_gpu\"."
-                            }
-
-                            // emulator 强制 cpu_gpu
-                            // val effectivePlugin = if (isEmulator) "cpu_gpu" else requested
                             val effectivePlugin = "npu"
-
                             val manifest = modelManager.getNexaManifest(spec)
                             val modelName = manifest?.ModelName?.takeIf { it.isNotBlank() } ?: spec.id
-
                             val modelDir = modelManager.modelDir(spec)
                             val entryPath = modelManager.entryPath(spec)
-
                             val dir = File(modelDir.absolutePath)
                             val entry = File(entryPath)
-                            require(dir.exists() && dir.isDirectory) { "Model dir missing: ${dir.absolutePath}" }
-                            require(entry.exists() && entry.isFile && entry.length() > 0L) { "Model file missing/empty: ${entry.absolutePath}" }
-
-                            Log.i("LifeLens", "createAndInitClient(): requested=$requested effective=$effectivePlugin")
-                            Log.i("LifeLens", "createAndInitClient(): modelName=$modelName")
-                            Log.i("LifeLens", "createAndInitClient(): modelDir=${dir.absolutePath}")
-                            Log.i("LifeLens", "createAndInitClient(): modelFile=${entry.absolutePath} len=${entry.length()}")
-
+                            require(dir.exists() && dir.isDirectory) {
+                                "Model dir missing: ${dir.absolutePath}"
+                            }
+                            require(entry.exists() && entry.isFile && entry.length() > 0L) {
+                                "Model file missing/empty: ${entry.absolutePath}"
+                            }
                             val mmproj = modelManager.mmprojPath(spec)
-                            Log.i("LifeLens", "createAndInitClient(): mmproj=$mmproj exists=${mmproj?.let { File(it).exists() }} len=${mmproj?.let { File(it).length() }}")
-
                             if (mmproj != null) {
                                 val f = File(mmproj)
-                                require(f.exists() && f.length() > 0L) { "mmproj missing/empty: $mmproj" }
+                                require(f.exists() && f.length() > 0L) {
+                                    "mmproj missing/empty: $mmproj"
+                                }
                             }
-
+                            Log.i("LifeLens", "Init client: plugin=$effectivePlugin model=$modelName")
                             val client = NexaVlmClient(
                                 context = context,
                                 modelName = modelName,
@@ -236,18 +230,10 @@ class MainActivity : ComponentActivity() {
                                 mmprojPath = mmproj,
                                 npuLibFolderPath = applicationInfo.nativeLibraryDir
                             )
-
                             client.init().getOrThrow()
                             client
                         }
                     }
-
-                suspend fun stopPreviousInference() {
-                    // 不要 cancel inferJob（否则会自杀）
-                    runCatching { activeClient?.stopStream() } // 停 native 推理
-                    isProcessing = false
-                }
-
 
                 fun handleAskWithImage() {
                     val q = questionText.trim()
@@ -257,121 +243,67 @@ class MainActivity : ComponentActivity() {
                     inferJob = scope.launch {
                         prev?.cancelAndJoin()
                         runCatching { activeClient?.stopStream() }
-
                         isProcessing = true
                         streamingAnswer = ""
-
-                        // Add user question to persistent history
-                        chatHistory.add(ChatMsg("user", q))
+                        currentAnswer = ""
 
                         try {
-                            val client = activeClient ?: error("Model not initialized. Tap Get Started first.")
+                            val client = activeClient ?: error("Model not initialized.")
 
-                            val imagePath: String = uploadedImagePath ?: run {
-                                if (!(cameraGranted && cameraReady)) {
-                                    error("No image yet. Please Upload Photo, or use Quick Test.")
-                                }
-                                headline = "Capturing..."
-
-                                val raw = File(context.cacheDir, "ask_capture_raw_${System.currentTimeMillis()}.jpg")
-                                val captured = takePhoto(context, imageCapture, raw)
-                                require(captured.exists() && captured.length() > 0L) { "Captured image is empty" }
-
-                                val prepared = prepareImageForVlm(
-                                    context,
-                                    captured.absolutePath,
-                                    maxSize = 448,
-                                    squareCrop = true
-                                )
-                                uploadedImagePath = prepared
-                                prepared
-                            }
+                            val imagePath: String = uploadedImagePath
+                                ?: error("No image. Please take or upload a photo first.")
 
                             val prompt = buildPrompt(audience, q)
-
-                            headline = "Thinking..."
-                            Log.d("LifeLens", "Ask with image=$imagePath plugin=$pluginId")
+                            Log.d("LifeLens", "Ask: image=$imagePath q=$q")
 
                             client.generateWithImageStream(imagePath, prompt).collect { token ->
                                 streamingAnswer += token
                             }
 
-                            // Add completed answer to persistent history
-                            chatHistory.add(ChatMsg("assistant", streamingAnswer))
-                            headline = "Ready"
+                            val finalAnswer = streamingAnswer
+                            currentAnswer = finalAnswer
+
+                            // Auto-read aloud
+                            ttsManager.speak(finalAnswer)
+
+                            // Save to persistent history
+                            historyRepository.save(imagePath, q, finalAnswer)
+                            historyEntries.clear()
+                            historyEntries.addAll(historyRepository.loadAll())
 
                         } catch (t: Throwable) {
-                            if (t is kotlinx.coroutines.CancellationException) {
-                                Log.d("LifeLens", "Inference cancelled")
-                                return@launch
-                            }
-
+                            if (t is CancellationException) return@launch
                             Log.e("LifeLens", "Ask failed", t)
-                            headline = "Failed"
-                            val errMsg = "Error: ${t.message ?: "Unknown"}"
-                            chatHistory.add(ChatMsg("system", errMsg))
-                        }
-                        finally {
+                            currentAnswer = "Sorry, something went wrong: ${t.message ?: "Unknown error"}"
+                        } finally {
                             isProcessing = false
                             streamingAnswer = ""
                         }
                     }
                 }
 
-
-                fun quickTestDefaultPhoto() {
-                    if (isProcessing) return
-                    val prev = inferJob
-                    inferJob = scope.launch {
-                        prev?.cancelAndJoin()
-                        runCatching { activeClient?.stopStream() }
-
-                        isProcessing = true
-                        streamingAnswer = ""
-
-                        try {
-                            val client = activeClient ?: error("Model not initialized. Tap Get Started first.")
-
-                            headline = "Loading default image..."
-
-                            val raw = copyAssetToCache(context, "advil_test.jpg")
-                            val prepared = prepareImageForVlm(context, raw, maxSize = 448, squareCrop = true)
-                            uploadedImagePath = prepared
-
-                            if (questionText.isBlank()) questionText = defaultQuestion(audience)
-                            val prompt = buildPrompt(Audience.ELDERLY, questionText)
-
-                            // Add user question to persistent history
-                            chatHistory.add(ChatMsg("user", questionText))
-
-                            headline = "Thinking..."
-
-                            client.generateWithImageStream(prepared, prompt).collect { token ->
-                                streamingAnswer += token
-                            }
-
-                            // Add completed answer to persistent history
-                            chatHistory.add(ChatMsg("assistant", streamingAnswer))
-                            headline = "Ready"
-
-                        } catch (t: Throwable) {
-                            if (t is kotlinx.coroutines.CancellationException) {
-                                Log.d("LifeLens", "Inference cancelled")
-                                return@launch
-                            }
-
-                            Log.e("LifeLens", "Ask failed", t)
-                            headline = "Failed"
-                            val errMsg = "Error: ${t.message ?: "Unknown"}"
-                            chatHistory.add(ChatMsg("system", errMsg))
-                        }
-                        finally {
-                            isProcessing = false
-                            streamingAnswer = ""
-                        }
+                fun startListening() {
+                    if (!audioGranted) {
+                        audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        return
                     }
+                    isListening = true
+                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                        putExtra(
+                            RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                            RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                        )
+                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.US.toString())
+                        putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                    }
+                    speechRecognizer?.startListening(intent)
                 }
 
+                fun stopListening() {
+                    speechRecognizer?.stopListening()
+                    isListening = false
+                }
 
                 fun startSetup() {
                     if (setupRunning) return
@@ -392,12 +324,10 @@ class MainActivity : ComponentActivity() {
                                 headline = "Downloading model..."
                                 detail = "This may take a while (large file). Keep the app open."
                                 progress = 0
-
                                 modelManager.downloadModel(spec).collect { p ->
                                     progress = p.overallPercent.coerceIn(0, 100)
                                     detail = "Downloading… ${progress}%  (${p.fileIndex}/${p.fileCount})"
                                 }
-
                                 val missingAfter = modelManager.missingFiles(spec)
                                 modelReady = missingAfter.isEmpty()
                                 if (!modelReady) error("Download incomplete. Missing: ${missingAfter.joinToString()}")
@@ -407,11 +337,9 @@ class MainActivity : ComponentActivity() {
                             detail = "Trying NPU…"
                             progress = null
 
-                            val tryOrder = listOf("npu")
                             var lastError: Throwable? = null
                             var okClient: NexaVlmClient? = null
-
-                            for (pid in tryOrder) {
+                            for (pid in listOf("npu")) {
                                 val r = createAndInitClient(pid)
                                 if (r.isSuccess) {
                                     okClient = r.getOrThrow()
@@ -419,28 +347,17 @@ class MainActivity : ComponentActivity() {
                                     break
                                 } else {
                                     lastError = r.exceptionOrNull()
-                                    Log.e("LifeLens", "Init failed for plugin=$pid", lastError)
+                                    Log.e("LifeLens", "Init failed plugin=$pid", lastError)
                                 }
                             }
-
-                            if (okClient == null) throw (lastError ?: RuntimeException("Init failed for all plugins"))
-
+                            if (okClient == null) throw (lastError ?: RuntimeException("Init failed"))
                             runCatching { activeClient?.destroy() }
                             activeClient = okClient
-
-                            detail = if (pluginId == "npu") "Started on NPU." else "Started on CPU/GPU."
-
-                            headline = "Almost ready"
-                            detail = "We’ll ask for camera permission so you can capture."
-                            progress = null
 
                             if (!cameraGranted) cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
                             bindCamera()
 
-                            phase = Phase.READY
-                            headline = "Ready"
-                            detail = "Upload or Capture, ask a question, or run Quick Test."
-                            progress = null
+                            phase = Phase.HOME
 
                         } catch (t: Throwable) {
                             Log.e("LifeLens", "Setup failed", t)
@@ -459,6 +376,49 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                // ── Bind camera as soon as HOME is reached ────────────────────
+                LaunchedEffect(phase) {
+                    if (phase == Phase.HOME && cameraGranted && !cameraReady) bindCamera()
+                }
+
+                // ── Auto-submit after voice recognition ───────────────────────
+                LaunchedEffect(speechResultReady) {
+                    if (speechResultReady) {
+                        speechResultReady = false
+                        if (questionText.isNotBlank()) handleAskWithImage()
+                    }
+                }
+
+                // ── Upload launcher ───────────────────────────────────────────
+                val uploadLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.GetContent()
+                ) { uri: Uri? ->
+                    if (uri == null) return@rememberLauncherForActivityResult
+                    scope.launch {
+                        runCatching {
+                            val rawFile = File(context.cacheDir, "upload_raw_${System.currentTimeMillis()}.jpg")
+                            copyUriToFile(context.contentResolver, uri, rawFile)
+                            require(rawFile.exists() && rawFile.length() > 0L) { "Uploaded file is empty" }
+                            val prepared = prepareImageForVlm(
+                                context, rawFile.absolutePath, maxSize = 448, squareCrop = true
+                            )
+                            uploadedImagePath = prepared
+                            currentAnswer = ""
+                            streamingAnswer = ""
+                            questionText = defaultQuestion(audience)
+                            phase = Phase.PHOTO
+                        }.onFailure { Log.e("LifeLens", "Upload failed", it) }
+                    }
+                }
+
+                // ── Bitmap for PhotoScreen ────────────────────────────────────
+                val photoBitmap = remember(uploadedImagePath) {
+                    uploadedImagePath?.let { path ->
+                        runCatching { BitmapFactory.decodeFile(path) }.getOrNull()
+                    }
+                }
+
+                // ── UI ────────────────────────────────────────────────────────
                 Surface {
                     when (phase) {
                         Phase.INTRO -> IntroScreen(
@@ -486,41 +446,52 @@ class MainActivity : ComponentActivity() {
                             }
                         )
 
-                        Phase.READY -> ReadyScreen(
-                            previewView = previewView,
-                            cameraGranted = cameraGranted,
-                            cameraReady = cameraReady,
-                            uploadedImagePath = uploadedImagePath,
-                            onRequestCamera = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
-                            onBindCamera = { bindCamera() },
-                            onUpload = { uploadLauncher.launch("image/*") },
-                            onCapture = {
+                        Phase.HOME -> HomeScreen(
+                            onHistory = { previousPhase = phase; phase = Phase.HISTORY },
+                            onCamera = {
                                 scope.launch {
                                     runCatching {
-                                        if (!(cameraGranted && cameraReady)) error("Camera not ready")
-                                        val raw = File(context.cacheDir, "capture_raw_${System.currentTimeMillis()}.jpg")
+                                        if (!cameraGranted) {
+                                            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                                            return@runCatching
+                                        }
+                                        if (!cameraReady) bindCamera()
+                                        val raw = File(
+                                            context.cacheDir,
+                                            "capture_${System.currentTimeMillis()}.jpg"
+                                        )
                                         val captured = takePhoto(context, imageCapture, raw)
-                                        require(captured.exists() && captured.length() > 0L) { "Captured image is empty" }
-
-                                        val prepared = prepareImageForVlm(context, captured.absolutePath, maxSize = 448, squareCrop = true)
+                                        require(captured.exists() && captured.length() > 0L) {
+                                            "Captured image is empty"
+                                        }
+                                        val prepared = prepareImageForVlm(
+                                            context, captured.absolutePath, maxSize = 448, squareCrop = true
+                                        )
                                         uploadedImagePath = prepared
-
-                                        if (questionText.isBlank()) questionText = defaultQuestion(audience)
-                                        headline = "Image ready"
-                                        detail = "Type a question and tap Ask."
-                                    }.onFailure {
-                                        headline = "Capture failed"
-                                        detail = it.message ?: "Unknown error"
-                                    }
+                                        currentAnswer = ""
+                                        streamingAnswer = ""
+                                        questionText = defaultQuestion(audience)
+                                        phase = Phase.PHOTO
+                                    }.onFailure { Log.e("LifeLens", "Capture failed", it) }
                                 }
                             },
-                            chatHistory = chatHistory,
+                            onUpload = { uploadLauncher.launch("image/*") },
+                            cameraGranted = cameraGranted,
+                            cameraReady = cameraReady
+                        )
+
+                        Phase.PHOTO -> PhotoScreen(
+                            bitmap = photoBitmap,
+                            currentAnswer = currentAnswer,
+                            streamingAnswer = streamingAnswer,
+                            isProcessing = isProcessing,
                             questionText = questionText,
                             onQuestionTextChange = { questionText = it },
-                            isProcessing = isProcessing,
-                            streamingAnswer = streamingAnswer,
-                            onAskSubmit = { handleAskWithImage() },
-                            onQuickTest = { quickTestDefaultPhoto() },
+                            isListening = isListening,
+                            onMicDown = { startListening() },
+                            onMicUp = { stopListening() },
+                            onSubmit = { handleAskWithImage() },
+                            onHistory = { previousPhase = phase; phase = Phase.HISTORY },
                             isSpeaking = isSpeaking,
                             onSpeakClick = { text -> ttsManager.speak(text) },
                             onStopSpeaking = { ttsManager.stop() },
@@ -529,6 +500,11 @@ class MainActivity : ComponentActivity() {
                                 speechSpeed = speed
                                 ttsManager.setSpeechRate(speed.rate)
                             }
+                        )
+
+                        Phase.HISTORY -> HistoryScreen(
+                            entries = historyEntries,
+                            onBack = { phase = previousPhase }
                         )
                     }
                 }
