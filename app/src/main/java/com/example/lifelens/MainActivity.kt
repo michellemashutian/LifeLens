@@ -241,8 +241,11 @@ class MainActivity : ComponentActivity() {
 
                     val prev = inferJob
                     inferJob = scope.launch {
-                        prev?.cancelAndJoin()
+                        // Must signal native to stop BEFORE cancelling the Kotlin coroutine.
+                        // Reversed order causes native thread to keep running after cancel,
+                        // leaving the wrapper in dirty state → applyChatTemplate fails on next call.
                         runCatching { activeClient?.stopStream() }
+                        prev?.cancelAndJoin()
                         isProcessing = true
                         streamingAnswer = ""
                         currentAnswer = ""
@@ -395,6 +398,16 @@ class MainActivity : ComponentActivity() {
                 ) { uri: Uri? ->
                     if (uri == null) return@rememberLauncherForActivityResult
                     scope.launch {
+                        // New image = new session: stop any in-flight inference first.
+                        runCatching { activeClient?.stopStream() }
+                        val staleJob = inferJob
+                        inferJob = null
+                        speechResultReady = false
+                        staleJob?.cancelAndJoin()
+                        isProcessing = false
+                        streamingAnswer = ""
+                        currentAnswer = ""
+
                         runCatching {
                             val rawFile = File(context.cacheDir, "upload_raw_${System.currentTimeMillis()}.jpg")
                             copyUriToFile(context.contentResolver, uri, rawFile)
@@ -403,8 +416,6 @@ class MainActivity : ComponentActivity() {
                                 context, rawFile.absolutePath, maxSize = 448, squareCrop = true
                             )
                             uploadedImagePath = prepared
-                            currentAnswer = ""
-                            streamingAnswer = ""
                             questionText = defaultQuestion(audience)
                             phase = Phase.PHOTO
                         }.onFailure { Log.e("LifeLens", "Upload failed", it) }
@@ -450,6 +461,18 @@ class MainActivity : ComponentActivity() {
                             onHistory = { previousPhase = phase; phase = Phase.HISTORY },
                             onCamera = {
                                 scope.launch {
+                                    // New image = new session: stop any in-flight inference first.
+                                    // Without this, the old coroutine finishes and overwrites
+                                    // currentAnswer with the previous image's answer.
+                                    runCatching { activeClient?.stopStream() }
+                                    val staleJob = inferJob
+                                    inferJob = null
+                                    speechResultReady = false
+                                    staleJob?.cancelAndJoin()
+                                    isProcessing = false
+                                    streamingAnswer = ""
+                                    currentAnswer = ""
+
                                     runCatching {
                                         if (!cameraGranted) {
                                             cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
@@ -468,8 +491,6 @@ class MainActivity : ComponentActivity() {
                                             context, captured.absolutePath, maxSize = 448, squareCrop = true
                                         )
                                         uploadedImagePath = prepared
-                                        currentAnswer = ""
-                                        streamingAnswer = ""
                                         questionText = defaultQuestion(audience)
                                         phase = Phase.PHOTO
                                     }.onFailure { Log.e("LifeLens", "Capture failed", it) }
