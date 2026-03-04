@@ -516,6 +516,22 @@ class MainActivity : ComponentActivity() {
                             onMicDown = { startListening() },
                             onMicUp = { stopListening() },
                             onSubmit = { handleAskWithImage() },
+                            onHome = {
+                                scope.launch {
+                                    runCatching { activeClient?.stopStream() }
+                                    val staleJob = inferJob
+                                    inferJob = null
+                                    speechResultReady = false
+                                    if (isListening) { speechRecognizer?.stopListening(); isListening = false }
+                                    ttsManager.stop()
+                                    staleJob?.cancelAndJoin()
+                                    isProcessing = false
+                                    streamingAnswer = ""
+                                    currentAnswer = ""
+                                    uploadedImagePath = null
+                                    phase = Phase.HOME
+                                }
+                            },
                             onHistory = { previousPhase = phase; phase = Phase.HISTORY },
                             isSpeaking = isSpeaking,
                             onSpeakClick = { text -> ttsManager.speak(text) },

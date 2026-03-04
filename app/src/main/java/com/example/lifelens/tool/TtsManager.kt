@@ -1,14 +1,10 @@
 package com.example.lifelens.tool
 
 import android.content.Context
-import android.media.MediaPlayer
-import android.media.PlaybackParams
-import android.os.Build
-import android.os.Handler
-import android.os.Looper
+import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
-import java.io.File
+import android.util.Log
 import java.util.Locale
 
 class TtsManager(
@@ -16,94 +12,55 @@ class TtsManager(
     private val onSpeakingChanged: (Boolean) -> Unit = {}
 ) : TextToSpeech.OnInitListener {
 
-    private val appContext = context.applicationContext
-    private var tts: TextToSpeech? = TextToSpeech(appContext, this)
+    private var tts: TextToSpeech? = TextToSpeech(context.applicationContext, this)
     private var ready = false
-    private var currentRate: Float = 0.45f  // mirrors SpeechSpeed.SLOW default
-    private var shouldPlay = false
-    private var player: MediaPlayer? = null
-    private val tempFile = File(appContext.cacheDir, "lifelens_tts.wav")
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private var currentRate: Float = 0.75f   // default = SLOW
 
     override fun onInit(status: Int) {
         ready = (status == TextToSpeech.SUCCESS)
         if (ready) {
             tts?.language = Locale.US
-            tts?.setPitch(0.95f)
+            tts?.setSpeechRate(currentRate)
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {}
+                override fun onStart(utteranceId: String?) {
+                    onSpeakingChanged(true)
+                }
 
                 override fun onDone(utteranceId: String?) {
-                    // Only play if speak() is still active (not stopped by user)
-                    if (utteranceId == SYNTH_ID && shouldPlay) {
-                        mainHandler.post { playFile() }
-                    }
+                    onSpeakingChanged(false)
                 }
 
                 @Deprecated("Deprecated in API")
                 override fun onError(utteranceId: String?) {
-                    mainHandler.post { onSpeakingChanged(false) }
+                    Log.w("TtsManager", "TTS error for $utteranceId")
+                    onSpeakingChanged(false)
                 }
             })
+        } else {
+            Log.e("TtsManager", "TTS init failed with status $status")
         }
     }
 
     fun setSpeechRate(rate: Float) {
         currentRate = rate
+        tts?.setSpeechRate(rate)
     }
 
     fun speak(text: String) {
-        if (!ready) return
-        // Stop anything currently playing or synthesizing
+        if (!ready) {
+            Log.w("TtsManager", "TTS not ready, ignoring speak()")
+            return
+        }
         tts?.stop()
-        stopPlayer()
-        shouldPlay = true
+        tts?.setSpeechRate(currentRate)
         onSpeakingChanged(true)
-        // Synthesize to file at normal speed; playback speed is controlled by MediaPlayer
-        tts?.synthesizeToFile(text, null, tempFile, SYNTH_ID)
-    }
-
-    private fun playFile() {
-        stopPlayer()
-        if (!shouldPlay) return
-        runCatching {
-            player = MediaPlayer().apply {
-                setDataSource(tempFile.absolutePath)
-                setOnPreparedListener { mp ->
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        runCatching {
-                            // setSpeed controls playback rate independently of TTS engine
-                            mp.playbackParams = PlaybackParams()
-                                .setSpeed(currentRate)
-                                .setPitch(1.0f)
-                        }
-                    }
-                    mp.start()
-                }
-                setOnCompletionListener {
-                    onSpeakingChanged(false)
-                    it.release()
-                    player = null
-                }
-                setOnErrorListener { _, _, _ ->
-                    onSpeakingChanged(false)
-                    true
-                }
-                prepareAsync()
-            }
-        }.onFailure { onSpeakingChanged(false) }
+        val params = Bundle()
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, UTTERANCE_ID)
     }
 
     fun stop() {
-        shouldPlay = false
         tts?.stop()
-        stopPlayer()
         onSpeakingChanged(false)
-    }
-
-    private fun stopPlayer() {
-        runCatching { player?.stop(); player?.release() }
-        player = null
     }
 
     fun shutdown() {
@@ -113,6 +70,6 @@ class TtsManager(
     }
 
     companion object {
-        private const val SYNTH_ID = "lifelens_synth"
+        private const val UTTERANCE_ID = "lifelens_tts"
     }
 }

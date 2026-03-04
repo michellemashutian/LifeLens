@@ -11,27 +11,22 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.example.lifelens.tool.SpeechSpeed
 
 @Composable
@@ -46,6 +41,7 @@ fun PhotoScreen(
     onMicDown: () -> Unit,
     onMicUp: () -> Unit,
     onSubmit: () -> Unit,
+    onHome: () -> Unit,
     onHistory: () -> Unit,
     isSpeaking: Boolean = false,
     onSpeakClick: (String) -> Unit = {},
@@ -56,7 +52,7 @@ fun PhotoScreen(
     val answerToShow = when {
         currentAnswer.isNotBlank() -> currentAnswer
         isProcessing && streamingAnswer.isNotBlank() -> streamingAnswer
-        isProcessing -> "..."
+        isProcessing -> "Analyzing..."
         else -> ""
     }
     val showAnswer = answerToShow.isNotBlank()
@@ -79,7 +75,7 @@ fun PhotoScreen(
             )
         }
 
-        // Dim overlay when showing answer for better readability
+        // Dim overlay when showing answer
         if (showAnswer) {
             Box(
                 modifier = Modifier
@@ -88,69 +84,64 @@ fun PhotoScreen(
             )
         }
 
-        // History icon — top left
-        IconButton(
-            onClick = onHistory,
+        // Top bar: Home (left) + History (right)
+        Row(
             modifier = Modifier
+                .fillMaxWidth()
                 .align(Alignment.TopStart)
-                .padding(12.dp)
-                .background(Color.Black.copy(alpha = 0.35f), CircleShape)
+                .padding(8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Icon(
-                Icons.Filled.History,
-                contentDescription = "History",
-                tint = Color.White.copy(alpha = 0.9f),
-                modifier = Modifier.size(26.dp)
-            )
-        }
-
-        // Question prompt — shown when no answer yet
-        if (!showAnswer) {
-            Text(
-                text = "What question\ndo you have?",
-                style = TextStyle(
-                    fontSize = 32.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White,
-                    shadow = Shadow(
-                        color = Color.Black.copy(alpha = 0.7f),
-                        offset = Offset(0f, 2f),
-                        blurRadius = 8f
-                    )
-                ),
-                textAlign = TextAlign.Center,
+            IconButton(
+                onClick = onHome,
                 modifier = Modifier
-                    .align(Alignment.Center)
-                    .padding(horizontal = 24.dp)
-                    .offset(y = (-60).dp)
-            )
+                    .background(Color.Black.copy(alpha = 0.35f), CircleShape)
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "Home",
+                    tint = Color.White,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+            IconButton(
+                onClick = onHistory,
+                modifier = Modifier
+                    .background(Color.Black.copy(alpha = 0.35f), CircleShape)
+            ) {
+                Icon(
+                    Icons.Filled.History,
+                    contentDescription = "History",
+                    tint = Color.White,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
         }
 
-        // Answer overlay — shown when answer is available
+        // Answer overlay
         if (showAnswer) {
             Box(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth(0.92f)
-                    .padding(bottom = 96.dp)
+                    .padding(bottom = 100.dp)
                     .background(
                         color = Color.Black.copy(alpha = 0.62f),
                         shape = RoundedCornerShape(16.dp)
                     )
                     .padding(16.dp)
             ) {
-                // Answer text
                 Text(
                     text = answerToShow,
                     style = MaterialTheme.typography.bodyLarge,
                     color = Color.White,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(end = 36.dp)  // space for speaker icon
+                        .padding(end = 36.dp)
                         .verticalScroll(rememberScrollState())
                 )
 
-                // Speaker + speed controls — top-right corner of answer box
+                // Speaker + speed controls — top-right of answer box
                 Column(
                     modifier = Modifier.align(Alignment.TopEnd),
                     horizontalAlignment = Alignment.CenterHorizontally
@@ -170,7 +161,6 @@ fun PhotoScreen(
                         )
                     }
 
-                    // Speed toggle S / N
                     SpeechSpeed.entries.forEach { speed ->
                         val selected = speechSpeed == speed
                         TextButton(
@@ -195,14 +185,15 @@ fun PhotoScreen(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .background(Color.Black.copy(alpha = 0.45f))
-                .padding(horizontal = 16.dp, vertical = 10.dp),
+                .background(Color.Black.copy(alpha = 0.55f))
+                .padding(horizontal = 12.dp, vertical = 10.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                // Text field
                 OutlinedTextField(
                     value = questionText,
                     onValueChange = onQuestionTextChange,
@@ -225,21 +216,36 @@ fun PhotoScreen(
                         cursorColor = Color.White,
                         focusedContainerColor = Color.White.copy(alpha = 0.12f),
                         unfocusedContainerColor = Color.White.copy(alpha = 0.08f)
-                    ),
-                    trailingIcon = if (questionText.isNotBlank() && !isProcessing) {
-                        {
-                            TextButton(onClick = onSubmit) {
-                                Text("Ask", color = Color.White, fontWeight = FontWeight.SemiBold)
-                            }
-                        }
-                    } else null
+                    )
                 )
+
+                // Ask button — prominent, always visible
+                Button(
+                    onClick = onSubmit,
+                    enabled = questionText.isNotBlank() && !isProcessing,
+                    modifier = Modifier.height(48.dp),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = Color.White,
+                        disabledContainerColor = Color.White.copy(alpha = 0.15f),
+                        disabledContentColor = Color.White.copy(alpha = 0.4f)
+                    )
+                ) {
+                    Icon(
+                        Icons.Filled.Send,
+                        contentDescription = "Ask",
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text("Ask", fontWeight = FontWeight.SemiBold)
+                }
 
                 // Mic button — hold to talk
                 FloatingActionButton(
                     onClick = {},
                     modifier = Modifier
-                        .size(52.dp)
+                        .size(48.dp)
                         .pointerInput(Unit) {
                             awaitPointerEventScope {
                                 while (true) {
@@ -258,7 +264,7 @@ fun PhotoScreen(
                     Icon(
                         Icons.Filled.Mic,
                         contentDescription = "Hold to talk",
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier.size(22.dp)
                     )
                 }
             }
@@ -278,7 +284,7 @@ fun PhotoScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .align(Alignment.TopCenter),
-                color = Color.White,
+                color = MaterialTheme.colorScheme.primary,
                 trackColor = Color.White.copy(alpha = 0.2f)
             )
         }
