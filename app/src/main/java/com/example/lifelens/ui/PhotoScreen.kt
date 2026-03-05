@@ -154,7 +154,7 @@ fun PhotoScreen(
                         modifier = Modifier.size(36.dp)
                     ) {
                         Icon(
-                            imageVector = if (isSpeaking) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
+                            imageVector = if (isSpeaking) Icons.Filled.VolumeUp else Icons.Filled.VolumeOff,
                             contentDescription = if (isSpeaking) "Stop" else "Read aloud",
                             tint = Color.White,
                             modifier = Modifier.size(22.dp)
