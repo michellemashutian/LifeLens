@@ -14,7 +14,7 @@ class TtsManager(
 
     private var tts: TextToSpeech? = TextToSpeech(context.applicationContext, this)
     private var ready = false
-    private var currentRate: Float = 0.75f   // default = SLOW
+    private var currentRate: Float = 0.5f   // default = SLOW
 
     override fun onInit(status: Int) {
         ready = (status == TextToSpeech.SUCCESS)
